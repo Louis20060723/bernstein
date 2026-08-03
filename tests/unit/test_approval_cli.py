@@ -179,9 +179,7 @@ def test_approve_flag_form_matches_alias_semantics(tmp_path: Path) -> None:
 
 def test_approve_flag_form_unknown_id_fails(tmp_path: Path) -> None:
     queue = _queue_at(tmp_path)
-    queue.push(
-        PendingApproval(session_id="S", agent_role="backend", tool_name="shell", tool_args={"command": "ls"})
-    )
+    queue.push(PendingApproval(session_id="S", agent_role="backend", tool_name="shell", tool_args={"command": "ls"}))
 
     result = CliRunner().invoke(approve, ["--tool", "ap-unknown", "--workdir", str(tmp_path)])
 

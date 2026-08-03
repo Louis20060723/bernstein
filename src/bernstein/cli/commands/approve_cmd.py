@@ -125,8 +125,7 @@ def approve(task_id: str | None, workdir: str, prompt: bool, tool_id: str | None
 
     if task_id is None:
         raise click.UsageError(
-            "Missing argument 'TASK_ID'; pass a task id, or --tool <id> "
-            "to resolve a pending tool-call approval."
+            "Missing argument 'TASK_ID'; pass a task id, or --tool <id> to resolve a pending tool-call approval."
         )
 
     from bernstein.core.orchestration.approval_gate import UnsafeApprovalIdError, approval_path
