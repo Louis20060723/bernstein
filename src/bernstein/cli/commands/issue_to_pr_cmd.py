@@ -34,8 +34,8 @@ def issue_to_pr_group() -> None:
     module stays importable and unchanged.
     """
     click.echo(
-        "deprecation: 'bernstein issue-to-pr' inspects a pipeline no shipped "
-        "runtime advances; it is deprecated and will be unregistered in 4.0.0 (#3144). "
+        "WARNING: 'bernstein issue-to-pr' is deprecated and will be removed in "
+        "v4.0.0 (#3144): it inspects a pipeline no shipped runtime advances. "
         "The core module bernstein.core.orchestration.issue_to_pr stays importable.",
         err=True,
     )

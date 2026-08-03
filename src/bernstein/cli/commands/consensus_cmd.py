@@ -58,8 +58,8 @@ def consensus_group(ctx: click.Context, path_str: str | None) -> None:
       bernstein consensus verify
     """
     click.echo(
-        "deprecation: 'bernstein consensus' inspects a relay store no shipped "
-        "runtime writes; it is deprecated and will be unregistered in 4.0.0 (#3144). "
+        "WARNING: 'bernstein consensus' is deprecated and will be removed in "
+        "v4.0.0 (#3144): it inspects a relay store no shipped runtime writes. "
         "The core module bernstein.core.orchestration.consensus_relay stays importable.",
         err=True,
     )
