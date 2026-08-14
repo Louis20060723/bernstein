@@ -76,7 +76,9 @@ def test_create_subtask_role_enum_matches_known_roles() -> None:
 
 
 def test_create_subtask_rejects_unknown_role_at_schema_boundary() -> None:
-    """Unknown role is refused by validate_tool_call, value appears in error."""
+    """Unknown role is refused by validate_tool_call, value appears in message."""
+    from bernstein.mcp.input_validation import ValidationError
+
     payload = {
         "parent_task_id": "p1",
         "goal": "g",
@@ -87,17 +89,17 @@ def test_create_subtask_rejects_unknown_role_at_schema_boundary() -> None:
         "estimated_minutes": 30,
     }
     result = validate_tool_call("bernstein_create_subtask", payload)
-    assert not hasattr(result, "payload") or not isinstance(result, type(result))
-    # validate_tool_call returns ValidatedPayload or ValidationError; the
-    # ValidationError path renders the offending value in the message.
-    assert result.__class__.__name__ == "ValidationError", (
+    assert isinstance(result, ValidationError), (
         f"unknown role must surface as ValidationError (acceptance #5), "
-        f"got {result.__class__.__name__}"
+        f"got {type(result).__name__}"
     )
-    rendered = json.dumps(result.__dict__)
-    assert "not-a-real-role" in rendered, (
-        "error message must name the offending value (acceptance #5) - "
-        "otherwise the caller cannot tell which field is wrong."
+    # Acceptance #5: the offending value must appear in either the top-level
+    # message or one of the per-violation reasons, so the caller knows which
+    # field is wrong.
+    blob = " ".join([result.message, *(e.get("reason", "") for e in result.errors)])
+    assert "not-a-real-role" in blob, (
+        f"error must name the offending value (acceptance #5); got message={result.message!r} "
+        f"errors={result.errors!r}"
     )
 
 
@@ -107,6 +109,7 @@ def test_create_subtask_rejects_unknown_role_at_schema_boundary() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def _drive_tool_past_timeout(mcp: Any, tool_name: str, args: dict[str, Any]) -> str:
     """Call ``tool_name`` with a patched handler that sleeps past the bound."""
     tool = mcp._tool_manager._tools[tool_name]  # pyright: ignore[reportPrivateUsage]
@@ -130,6 +133,7 @@ async def _drive_tool_past_timeout(mcp: Any, tool_name: str, args: dict[str, Any
         tool.fn = original
 
 
+@pytest.mark.asyncio
 async def test_server_enforces_declared_timeout_for_host_effect_tools() -> None:
     """Drive bernstein_post_artifact past its bound - returns structured error."""
     mcp = create_mcp_server(tier="all", lineage_enabled=True)
@@ -169,14 +173,13 @@ async def test_server_enforces_declared_timeout_for_host_effect_tools() -> None:
             server_mod._post_artifact_impl = original_post  # type: ignore[assignment]
 
 
-def test_pass_within_bound_returns_normal_payload() -> None:
+@pytest.mark.asyncio
+async def test_pass_within_bound_returns_normal_payload() -> None:
     """A call that finishes well inside the declared bound returns the
     normal payload (acceptance #3: pass-after)."""
     mcp = create_mcp_server(tier="all", lineage_enabled=True)
     # bernstein_status with status=None is a near-instant local read.
-    result = asyncio.run(
-        mcp.call_tool("bernstein_status", {"status": None, "detail": False})
-    )
+    result = await mcp.call_tool("bernstein_status", {"status": None, "detail": False})
     text = result.content[0].text if hasattr(result, "content") else json.dumps(result)
     # It either succeeded normally or returned a structured outage/error -
     # but it must NOT be the timeout error shape.
