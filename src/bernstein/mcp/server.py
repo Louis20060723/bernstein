@@ -1858,8 +1858,8 @@ def _apply_tool_timeouts(mcp: FastMCP[None]) -> None:
 
     # FastMCP exposes no public per-tool timeout hook, so replace the call
     # path on the tool manager directly (same access pattern as
-    # _apply_tool_tier). ``setattr`` keeps the method patch off the class.
-    setattr(manager, "call_tool", bounded_call)
+    # _apply_tool_tier).
+    manager.call_tool = bounded_call  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def _apply_advertised_schemas(mcp: FastMCP[None]) -> None:
