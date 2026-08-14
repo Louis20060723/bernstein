@@ -51,8 +51,7 @@ def test_host_effect_tools_declare_timeout_seconds() -> None:
     for name in _HOST_EFFECT_TOOLS:
         schema = schemas[name]
         assert "timeoutSeconds" in schema, (
-            f"{name} must declare timeoutSeconds so the bound is advertised "
-            "(acceptance #1)."
+            f"{name} must declare timeoutSeconds so the bound is advertised (acceptance #1)."
         )
         declared = schema["timeoutSeconds"]
         assert isinstance(declared, (int, float))
@@ -90,16 +89,14 @@ def test_create_subtask_rejects_unknown_role_at_schema_boundary() -> None:
     }
     result = validate_tool_call("bernstein_create_subtask", payload)
     assert isinstance(result, ValidationError), (
-        f"unknown role must surface as ValidationError (acceptance #5), "
-        f"got {type(result).__name__}"
+        f"unknown role must surface as ValidationError (acceptance #5), got {type(result).__name__}"
     )
     # Acceptance #5: the offending value must appear in either the top-level
     # message or one of the per-violation reasons, so the caller knows which
     # field is wrong.
     blob = " ".join([result.message, *(e.get("reason", "") for e in result.errors)])
     assert "not-a-real-role" in blob, (
-        f"error must name the offending value (acceptance #5); got message={result.message!r} "
-        f"errors={result.errors!r}"
+        f"error must name the offending value (acceptance #5); got message={result.message!r} errors={result.errors!r}"
     )
 
 
@@ -138,6 +135,13 @@ async def test_server_enforces_declared_timeout_for_host_effect_tools() -> None:
     """Drive bernstein_post_artifact past its bound - returns structured error."""
     mcp = create_mcp_server(tier="all", lineage_enabled=True)
 
+    # Shorten the declared bound so the test can drive past it quickly; the
+    # schema's real 30s bound would make the test take half a minute.
+    registry = get_registry()
+    schema = registry.schemas["bernstein_post_artifact"]
+    original_bound = schema.get("timeoutSeconds")
+    schema["timeoutSeconds"] = 0.05
+
     # patch the handler's network step to wait, so the call surfaces a timeout.
     import bernstein.mcp.server as server_mod
 
@@ -161,9 +165,7 @@ async def test_server_enforces_declared_timeout_for_host_effect_tools() -> None:
             },
         )
         parsed = json.loads(text)
-        assert parsed.get("error") or parsed.get("timeout"), (
-            f"expected structured timeout error, got: {parsed}"
-        )
+        assert parsed.get("error") or parsed.get("timeout"), f"expected structured timeout error, got: {parsed}"
         # Acceptance #2: the error names the tool and the limit.
         msg = json.dumps(parsed)
         assert "bernstein_post_artifact" in msg
@@ -171,6 +173,10 @@ async def test_server_enforces_declared_timeout_for_host_effect_tools() -> None:
     finally:
         if original_post is not None:
             server_mod._post_artifact_impl = original_post  # type: ignore[assignment]
+        if original_bound is None:
+            schema.pop("timeoutSeconds", None)
+        else:
+            schema["timeoutSeconds"] = original_bound
 
 
 @pytest.mark.asyncio
