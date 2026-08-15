@@ -140,20 +140,13 @@ def _parse_raw_payload(
         if template_vars is not None and declared_type == "stdio":
             cmd_obj: object = expanded_defn.get("command", [])
             if isinstance(cmd_obj, list):
-                expanded_defn["command"] = _expand_command(
-                    [str(c) for c in cmd_obj], template_vars
-                )
+                expanded_defn["command"] = _expand_command([str(c) for c in cmd_obj], template_vars)
             args_obj: object = expanded_defn.get("args", [])
             if isinstance(args_obj, list):
-                expanded_defn["args"] = _expand_command(
-                    [str(a) for a in args_obj], template_vars
-                )
+                expanded_defn["args"] = _expand_command([str(a) for a in args_obj], template_vars)
             env_obj: object = expanded_defn.get("env", {})
             if isinstance(env_obj, dict):
-                expanded_defn["env"] = {
-                    str(k): str(_substitute(v, template_vars))
-                    for k, v in env_obj.items()
-                }
+                expanded_defn["env"] = {str(k): str(_substitute(v, template_vars)) for k, v in env_obj.items()}
         expanded[name] = expanded_defn
 
     configs = parse_server_configs(expanded)
