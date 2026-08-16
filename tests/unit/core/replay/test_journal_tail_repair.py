@@ -74,7 +74,7 @@ def test_resume_succeeds_after_repair(tmp_path) -> None:
 
 
 def test_resume_refusal_names_the_repair_path_for_a_torn_tail(tmp_path) -> None:
-    path, _ = _torn_journal(tmp_path)
+    _path, _ = _torn_journal(tmp_path)
 
     with pytest.raises(ValueError, match=r"repair"):
         EventJournal.resume("torn-run", tmp_path / ".sdd")
