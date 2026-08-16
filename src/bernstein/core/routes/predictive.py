@@ -103,7 +103,6 @@ def get_predictions(
         float,
         Query(
             ge=0.0,
-            allow_inf_nan=False,
             description="Budget ceiling in USD (0 = skip budget forecast)",
         ),
     ] = 0.0,
@@ -112,7 +111,6 @@ def get_predictions(
         Query(
             ge=0.1,
             le=72.0,
-            allow_inf_nan=False,
             description="Configured run window in hours (default 4)",
         ),
     ] = 4.0,
@@ -130,11 +128,6 @@ def get_predictions(
 
     Use ``budget_cap`` to enable the budget forecast. The run duration
     forecast requires at least one completed task.
-
-    Both numeric parameters are echoed into the response body, so both
-    refuse non-finite values with a 422 rather than admitting them: a
-    range bound alone does not exclude ``+Infinity`` (``inf >= 0.0`` is
-    true), and the JSON renderer cannot serialise it.
 
     The budget forecast is scoped to ``tenant_id``: the spend series it is
     built from is narrowed to cost points recorded for the caller's tenant,

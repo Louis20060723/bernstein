@@ -104,16 +104,20 @@ rather than as its own attribution is exempted by hand there, with the reason.
 
 ## Fixed
 
-- `GET /metrics/predictions` answers `422` instead of crashing with a `500`
-  when `budget_cap` or `window_hours` is given a non-finite value such as
-  `Infinity`. `budget_cap` carried a `ge=0.0` bound only, which `+Infinity`
-  satisfies, and the handler echoes the value into the response body, where
-  the JSON renderer refuses it (`Out of range float values are not JSON
-  compliant: inf`) and the request fell through to the crash guard. Both
-  numeric query parameters now reject non-finite values at the parameter
-  boundary, before the handler runs. A budget ceiling of infinity is not a
-  USD amount; finite values are unaffected.
-
+- A run journal whose trailing bytes are an incomplete multi-byte character no
+  longer wedges the tolerant reader (#3971). `load_events` treated undecodable
+  bytes as an error from the codec rather than as a malformed line, so one
+  class of crash produced two outcomes depending on where in the byte stream it
+  stopped: a discarded physical line index when the write stopped between two
+  characters, and a bare `UnicodeDecodeError` — carrying no line index, and
+  losing every earlier event in the file — when it stopped inside one. Bytes
+  that are not valid UTF-8 now travel the same two reader policies as
+  unparsable JSON: discarded by the tolerant reader and reported in
+  `discarded_line_indices`, raised by `strict=True` as a `JournalParseError`
+  naming the 0-based physical line. Physical line indices are unchanged for
+  every journal that read successfully before. A row whose only defect is one
+  undecodable byte is discarded rather than repaired, so no silently altered
+  event can enter the chain.
 - The CLI reference no longer names command spellings that do not resolve. It
   claimed `bernstein commit-stats`, `bernstein incident`, and `bernstein
   postmortem` were live deprecated aliases after v4.0.0 removed them, and
