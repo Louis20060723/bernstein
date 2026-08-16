@@ -606,8 +606,16 @@ def _torn_tail_indices(path: Path) -> tuple[int, ...]:
     # We re-read the physical lines to answer "is this the tail" without
     # re-parsing (the issue's "answerable without a second scan" promise
     # is about parsing; counting lines is cheap and exact).
+    # ``errors="surrogateescape"`` matches the decode policy the tolerant
+    # reader uses. A tear in the middle of a multi-byte character is one
+    # of the two shapes this function exists to identify, and a strict
+    # decode raises UnicodeDecodeError on it -- which derives from
+    # ValueError, so ``except OSError`` would not catch it and the
+    # function would propagate instead of reporting the tail. Widening
+    # the except clause is the wrong fix: it returns "nothing to repair"
+    # for exactly the journal that needs repairing.
     try:
-        with path.open(encoding="utf-8") as f:
+        with path.open(encoding="utf-8", errors="surrogateescape") as f:
             physical_lines = f.readlines()
     except OSError:
         return ()
@@ -696,10 +704,23 @@ def repair_journal_tail(
     # byte up to that line belongs to the surviving chain, so the prefix
     # is restored exactly (issue: "removing it restores exactly the
     # bytes the surviving head already commits to").
-    with path.open(encoding="utf-8") as f:
-        lines = f.readlines()
-    prefix = "".join(lines[: min(torn)])
-    path.write_text(prefix, encoding="utf-8")
+    #
+    # os.truncate() is a single metadata operation that never rewrites
+    # the surviving bytes. Reading the prefix and writing it back would
+    # open the file with "w", zeroing it before the rewrite: a crash in
+    # that window destroys a journal whose only damage was a torn tail,
+    # which is the failure this command exists to repair. Counting the
+    # cut in bytes also avoids a decode/encode round-trip of bytes that
+    # are supposed to come through untouched.
+    raw = path.read_bytes()
+    cut = 0
+    for _ in range(min(torn)):
+        newline = raw.find(b"\n", cut)
+        if newline == -1:
+            cut = len(raw)
+            break
+        cut = newline + 1
+    os.truncate(path, cut)
 
     return JournalRepairResult(
         repaired=True,
