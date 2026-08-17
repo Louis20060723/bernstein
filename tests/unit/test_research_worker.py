@@ -17,6 +17,11 @@ dispatch path a coding spawn uses. These tests prove the end-to-end guarantee:
 
 from __future__ import annotations
 
+import http.server
+import sys
+import threading
+import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -243,3 +248,142 @@ def test_research_runs_dispatch_next_to_coding_tasks_with_cost_caps(tmp_path: Pa
     assert kinds == {"coding-0": "coding", "research-0": "research"}
     # The research stage stayed inside its 2-fetch cap.
     assert len(run.fetched) == 2
+
+
+# ---------------------------------------------------------------------------
+# rendering source fetcher (#3120): captured bytes contain the cited span
+# ---------------------------------------------------------------------------
+
+# Built by string concatenation in the page script so the *static* response
+# does not contain the marker as a contiguous string -- only the rendered DOM
+# does. A fetcher that silently falls back to static fetching would therefore
+# fail the positive assertion below.
+_RENDER_MARKER = "CITED-SPAN-MARKER-9x7"
+_RENDER_PAGE = """<!DOCTYPE html><html><body>
+<p>Static shell paragraph without the marker.</p>
+<script>
+document.body.appendChild(Object.assign(document.createElement('span'), {
+  id: 'cite',
+  textContent: 'CITED' + '-SPAN-MARKER-9x7'
+}));
+</script>
+</body></html>"""
+
+
+class _FixtureHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        body = _RENDER_PAGE.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+@pytest.fixture(scope="module")
+def fixture_server() -> str:
+    """Local fixture page served over loopback; tests never reach the internet."""
+    server = http.server.HTTPServer(("127.0.0.1", 0), _FixtureHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}/page.html"
+    server.shutdown()
+
+
+@pytest.fixture
+def _rendering_browser() -> Iterator[None]:
+    """Lift the 2 GB RLIMIT_AS the suite applies session-wide, then restore it.
+
+    ``tests/conftest.py`` pins RLIMIT_AS to 2 GB to keep the test process's
+    RSS in check. A headless Chromium needs more virtual address space than
+    that just to launch, and child processes inherit the limit, so rendering
+    fetches would die with a closed-browser error on launch. Tests that
+    exercise the rendering fetcher restore the hard limit for the duration
+    of the fetch and put the suite cap back afterwards.
+    """
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if hard == resource.RLIM_INFINITY or hard > soft:
+        resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+    yield
+    resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
+
+
+def test_rendering_fetch_records_script_injected_span(fixture_server: str, _rendering_browser: Iterator[None]) -> None:
+    """Captured bytes contain the cited span when the static bytes do not."""
+    from bernstein.core.orchestration.rendering_fetcher import make_rendering_fetcher
+
+    # Half 1: the static fetcher's bytes do NOT contain the span.
+    static = urllib.request.urlopen(fixture_server, timeout=10).read()
+    assert _RENDER_MARKER.encode() not in static
+
+    # Half 2: the rendering fetcher's bytes DO contain it. Asserting both
+    # halves means a regression that silently drops back to static fetching
+    # fails instead of passing quietly.
+    rendered = make_rendering_fetcher()(fixture_server)
+    assert _RENDER_MARKER.encode() in rendered
+
+
+def test_rendering_fetch_refuses_typed_error_naming_source(
+    _rendering_browser: Iterator[None],
+) -> None:
+    """A page that cannot render raises a typed refusal naming the source."""
+    from bernstein.core.orchestration.rendering_fetcher import (
+        RenderingFetchError,
+        make_rendering_fetcher,
+    )
+
+    # Port 1 on loopback refuses connections; there is nothing to render.
+    unreachable = "http://127.0.0.1:1/unreachable"
+    with pytest.raises(RenderingFetchError) as exc_info:
+        make_rendering_fetcher()(unreachable)
+    assert unreachable in str(exc_info.value)
+
+
+def test_failed_render_never_reaches_activity_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _rendering_browser: Iterator[None],
+) -> None:
+    """A failed render records no observation: activity.fetch is never hit."""
+    from bernstein.core.orchestration.activity_modalities import ResearchActivity
+    from bernstein.core.orchestration.rendering_fetcher import (
+        RenderingFetchError,
+        make_rendering_fetcher,
+    )
+
+    calls: list[tuple[str, bytes]] = []
+    original = ResearchActivity.fetch
+
+    def spy(self: ResearchActivity, source_ref: str, content: bytes) -> Observation:
+        calls.append((source_ref, content))
+        return original(self, source_ref, content)
+
+    monkeypatch.setattr(ResearchActivity, "fetch", spy)
+
+    worker = _worker(tmp_path, max_fetches=5)
+    with pytest.raises(RenderingFetchError):
+        worker.run(
+            query="q",
+            sources=["http://127.0.0.1:1/unreachable"],
+            fetch_fn=make_rendering_fetcher(),
+            synthesise=_synth_two,
+        )
+    assert calls == []
+
+
+def test_rendering_fetch_refuses_when_backend_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent backend yields a typed unavailable error naming the package."""
+    from bernstein.core.orchestration.rendering_fetcher import (
+        RenderingBackendUnavailableError,
+        make_rendering_fetcher,
+    )
+
+    monkeypatch.setitem(sys.modules, "crawl4ai", None)
+    with pytest.raises(RenderingBackendUnavailableError, match="crawl4ai"):
+        make_rendering_fetcher()
