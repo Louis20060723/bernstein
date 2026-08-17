@@ -292,24 +292,53 @@ def fixture_server() -> str:
     server.shutdown()
 
 
+_BROWSER_AVAILABLE: bool | None = None
+
+
+def _browser_available() -> bool:
+    """Whether a headless Chromium can actually launch in this process.
+
+    Probed once and cached. The unit lane installs no browser binary, so
+    contributors and CI see a skip rather than a red; the dedicated
+    rendering lane (``.github/workflows/rendering-lane.yml``) installs the
+    browser and raises the suite memory ceiling, so the probe passes there
+    and the assertions below really run.
+    """
+    global _BROWSER_AVAILABLE
+    if _BROWSER_AVAILABLE is not None:
+        return _BROWSER_AVAILABLE
+    try:
+        import asyncio
+
+        from playwright.async_api import async_playwright
+
+        async def _probe() -> None:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                await browser.close()
+
+        asyncio.run(_probe())
+        _BROWSER_AVAILABLE = True
+    except Exception:
+        # Executable absent (unit lane) or launch refused (e.g. the suite's
+        # 2 GB RLIMIT_AS guard kills the child before it can start).
+        _BROWSER_AVAILABLE = False
+    return _BROWSER_AVAILABLE
+
+
 @pytest.fixture
 def _rendering_browser() -> Iterator[None]:
-    """Lift the 2 GB RLIMIT_AS the suite applies session-wide, then restore it.
+    """Skip unless a headless Chromium can actually launch in this process.
 
-    ``tests/conftest.py`` pins RLIMIT_AS to 2 GB to keep the test process's
-    RSS in check. A headless Chromium needs more virtual address space than
-    that just to launch, and child processes inherit the limit, so rendering
-    fetches would die with a closed-browser error on launch. Tests that
-    exercise the rendering fetcher restore the hard limit for the duration
-    of the fetch and put the suite cap back afterwards.
+    These tests deliberately do not lift the suite's session-wide 2 GB
+    RLIMIT_AS guard (``tests/conftest.py``): lifting it inside a test would
+    leave every later test in the worker unguarded if the process dies
+    between the lift and the restore. The rendering lane raises the ceiling
+    up front via ``BERNSTEIN_MEM_GUARD_GB`` instead.
     """
-    import resource
-
-    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-    if hard == resource.RLIM_INFINITY or hard > soft:
-        resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+    if not _browser_available():
+        pytest.skip("headless Chromium unavailable (installed by the rendering lane)")
     yield
-    resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
 
 
 def test_rendering_fetch_records_script_injected_span(fixture_server: str, _rendering_browser: Iterator[None]) -> None:
@@ -384,6 +413,10 @@ def test_rendering_fetch_refuses_when_backend_missing(
         make_rendering_fetcher,
     )
 
-    monkeypatch.setitem(sys.modules, "crawl4ai", None)
-    with pytest.raises(RenderingBackendUnavailableError, match="crawl4ai"):
+    # Pre-imported siblings (the probe above imports the package) make a
+    # bare `sys.modules["playwright"] = None` a no-op on 3.12+: the parent
+    # entry is ignored when the child module is already cached. Null the
+    # child module so the from-import halts with a real ImportError.
+    monkeypatch.setitem(sys.modules, "playwright.async_api", None)
+    with pytest.raises(RenderingBackendUnavailableError, match="playwright"):
         make_rendering_fetcher()
