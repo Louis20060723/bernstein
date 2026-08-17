@@ -256,6 +256,7 @@ nav:
           - Plugin SDK: integrations/plugin-sdk.md
           - Agent sessions: integrations/agent-session.md
           - agents-md sync: agents-md.md
+          - Agent catalogs: operations/agent-catalogs.md
           - Skills catalog: operations/skills-catalog.md
           - Skill lint: operations/skill-lint.md
           - Skill selection rules: operations/skill-selection-rules.md
@@ -511,6 +512,8 @@ nav:
           - SPIFFE workload identity: reference/spiffe-workload-identity.md
           - Volunteer project manifest: reference/volunteer-manifest.md
           - Volunteer sandbox profile: reference/volunteer-sandbox.md
+          - Volunteer issue text: reference/volunteer-issue-text.md
+          - Volunteer task runner: reference/volunteer-runner.md
           - MCP catalog: reference/mcp-catalog.md
           - MCP tool tiers: mcp/tool_tiers.md
       - Compatibility & limits:
@@ -522,6 +525,7 @@ nav:
       - Release notes:
           - Changelog: CHANGELOG.md
           - Unreleased: release-notes/unreleased.md
+          - v3.16.0: release-notes/v3.16.0.md
           - v3.15.1: release-notes/v3.15.1.md
           - v3.15.0: release-notes/v3.15.0.md
           - v3.14.159: release-notes/v3.14.159.md

@@ -15,7 +15,7 @@
 > *"To achieve great things, two things are needed: a plan and not quite enough time."* - [attributed to](https://quoteinvestigator.com/2020/08/19/plan-time/) Leonard Bernstein
 
 ### 決定論的なマルチエージェント CLI オーケストレーション
-<!-- l10n: en="deterministic multi-agent CLI orchestration" hash="sha256:7db8022f8b39" -->
+<!-- l10n: en="deterministic multi-agent CLI orchestration" hash="sha256:f62c23f34e14" -->
 
 [![CI](https://github.com/sipyourdrink-ltd/bernstein/actions/workflows/ci.yml/badge.svg)](https://github.com/sipyourdrink-ltd/bernstein/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/bernstein)](https://pypi.org/project/bernstein/)
@@ -30,7 +30,7 @@
 
 [website](https://bernstein.run) &middot; [docs](https://bernstein.readthedocs.io/) &middot; [install](https://bernstein.readthedocs.io/en/latest/getting-started/install/) &middot; [first run](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/getting-started/first-run.md) &middot; [glossary](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/GLOSSARY.md) &middot; [limitations](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/reference/KNOWN_LIMITATIONS.md) &middot; [name policy](https://github.com/sipyourdrink-ltd/bernstein/blob/main/TRADEMARKS.md) &middot; [sponsor](https://github.com/sponsors/chernistry)
 
-[简体中文](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.zh-Hans.md) &middot; [繁體中文](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.zh-TW.md) &middot; [日本語](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.ja.md) &middot; [한국어](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.ko.md)
+[简体中文](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.zh-Hans.md) &middot; [繁體中文](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.zh-TW.md) &middot; [日本語](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.ja.md) &middot; [한국어](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.ko.md) &middot; [हिन्दी](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.hi.md) &middot; [বাংলা](https://github.com/sipyourdrink-ltd/bernstein/blob/main/README.bn.md)
 
 </div>
 
@@ -140,7 +140,7 @@ Claude Code、Codex CLI、Gemini CLI、GitHub Copilot CLI、Cursor、Aider、Goo
 同じ実行の中でエージェントを混ぜられる。定型作業には安価なローカルモデル、設計には重いクラウドモデルというように。`bernstein integrations list --installed` は自分のマシンで使えるものを表示する。
 
 ### 表紙の先へ
-<!-- l10n: en="beyond the front page" hash="sha256:a1aa323fcf03" -->
+<!-- l10n: en="beyond the front page" hash="sha256:ee01fbaaebd6" -->
 
 踏み込んだ内容はすべて[ドキュメントサイト](https://bernstein.readthedocs.io/)にある:
 
@@ -152,6 +152,7 @@ Claude Code、Codex CLI、Gemini CLI、GitHub Copilot CLI、Cursor、Aider、Goo
 | [Web UI](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/gui/index.md) | TUI と同じ API 上で動くブラウザダッシュボード |
 | [クラウド実行](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/cloudflare/cloudflare-overview.md) | 実験的: 自分のアカウントで Cloudflare Workers 上のエージェントを R2 ワークスペース同期とともに走らせる。ホステッドの `api.bernstein.run` サービスはまだ提供されていない |
 | [データソース](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/datasources.md) | 読み取り専用のクエリレシート、および各結果を導出元のスキーマスナップショットに結び付けるクエリドライバ |
+| [エージェントカタログ](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/agent-catalogs.md) | 組み込みテンプレート以外のエージェント定義をロールから参照する。汎用の YAML/SKILL.md ディレクトリ、または Claude Code のプラグインレイアウトのツリー |
 | [セキュリティ](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/operations/security.md) | スコアカード、ファジング、ハードニング |
 | [アーキテクチャ](https://github.com/sipyourdrink-ltd/bernstein/blob/main/docs/architecture/ARCHITECTURE.md) | 内部の仕組み |
 

@@ -4,9 +4,9 @@
 
 - **`bernstein replay <RUN_ID>`** - the original replay, optionally with task-trace re-submission.
 - **`bernstein replay diff RUN_A RUN_B`** - localise the first divergence between two recorded runs.
-- **`bernstein replay export <AGENT_ID> -o RECEIPT`** - write a portable per-step receipt.
-- **`bernstein replay publish <AGENT_ID> -o RECEIPT`** - write a redacted receipt for publishing.
-- **`bernstein replay verify <RECEIPT>`** - offline verifier for an exported receipt.
+- **`bernstein replay export <AGENT_ID> [OUT]`** - write a portable per-step receipt.
+- **`bernstein replay publish <AGENT_ID> [OUT]`** - write a redacted receipt for publishing (needs `--yes-i-want-to-publish`).
+- **`bernstein replay verify <RECEIPT>`** - offline verifier for an exported or published receipt.
 - **`bernstein replay diff-journal A B`** - per-step divergence finder across two journals.
 
 All subcommands read from the same underlying journal on disk. The base command additionally supports **task-trace replay**, which re-creates a new task from a stored task trace and (optionally) compares the replay's `result_summary` against the original via a colour diff.
@@ -88,6 +88,45 @@ bernstein replay T-abc123 --model opus --extra-context "Make sure tests pass on 
 
 ---
 
+## Machine-readable output (`--as-json`)
+
+The flag is `--as-json`, and every subcommand emits a payload on success:
+
+| Surface | Emits on success |
+|---|---|
+| `bernstein replay <AGENT_ID>` | `{agent_id, head_hash, steps, entries[]}` |
+| `bernstein replay <RUN_ID> --verify` | chain verdict, head hash, and the divergent step when one exists |
+| `bernstein replay diff-journal A B` | `{diverged, seq, fields_changed[], left_values, right_values, reason}` |
+| `bernstein replay debug ...` | head hash, step count, receipt path, whether it was signed |
+| `bernstein replay export` | `{agent_id, output, head_hash, steps, signed}` |
+| `bernstein replay publish` | the same, **plus `original_head_hash`** |
+| `bernstein replay verify <RECEIPT>` | `{ok, head_hash, steps, errors, signed}` |
+
+`publish` reporting both hashes is the machine-readable form of what redaction
+means: it rewrites the payloads, so the published head is *not* the exported
+one. A script comparing `head_hash` across an export and a publish of the same
+agent would otherwise reasonably conclude something had been corrupted.
+
+**Failure paths are still prose**, on every one of these. That matters most on
+`verify`, which has two different failures that both exit `1`:
+
+- the receipt verifies *false* - emits `{ok: false, ..., errors: [...]}`
+- the receipt is *malformed* - prints prose
+
+Same exit status, one parseable and one not, and no way to tell which you are
+getting before you try. Those route to different people: "this chain does not
+verify" is a finding about the run, "this file is not a receipt" is a finding
+about the invocation. Until that is closed, a scripted caller has to treat a
+parse failure as a third outcome rather than an error. Tracked in
+[#3996](https://github.com/sipyourdrink-ltd/bernstein/issues/3996).
+
+**The exit code is the verdict, not the payload.** This was true when these
+verbs ignored `--as-json` and it stays true now that they honour it: `verify`
+emits a payload *and* exits non-zero on a receipt mismatch, so a caller that
+reads stdout and ignores the exit status still sees a refused chain as a
+success. A payload is not an assertion that the operation succeeded. Check the
+exit code first and treat any payload as detail.
+
 ## Subcommands
 
 Beyond the base run/task replay, `bernstein replay` exposes subcommands for diffing runs and for exporting and verifying portable receipts.
@@ -104,21 +143,53 @@ bernstein replay diff 20260415-143022 20260415-150118
 
 Per-step divergence finder across two journals. Like `diff` but operates directly on two journal paths, reporting the first step index where the chains diverge.
 
-### `bernstein replay export <AGENT_ID> -o RECEIPT`
+`--as-json` emits `{diverged, seq, fields_changed[], left_values, right_values, reason}`, and the command exits `1` when `diverged` is true, so the exit code and the payload agree.
 
-Writes a portable per-step receipt for an agent's journal to the path given by `-o`. The receipt carries the step chain and its head hash so it can be verified offline by another party.
+### `bernstein replay export <AGENT_ID> [OUT]`
 
-```bash
-bernstein replay export backend-abc -o receipt.json
-```
+Writes a portable per-step receipt for an agent's journal. The receipt carries the step chain and its head hash so it can be verified offline by another party.
 
-### `bernstein replay publish <AGENT_ID> -o RECEIPT`
-
-Same as `export`, but produces a redacted receipt suitable for publishing. Sensitive fields are stripped while the head hash still anchors the visible steps.
+The destination is an optional **positional** argument, not a flag. Omit it and
+the receipt lands at `.sdd/runtime/receipts/<AGENT_ID>.tar`.
 
 ```bash
-bernstein replay publish backend-abc -o receipt.public.json
+# explicit destination
+bernstein replay export backend-abc receipt.tar
+
+# default destination: .sdd/runtime/receipts/backend-abc.tar
+bernstein replay export backend-abc
 ```
+
+### `bernstein replay publish <AGENT_ID> [OUT]`
+
+Same as `export`, but produces a redacted receipt suitable for publishing. Sensitive fields are stripped while the head hash still anchors the visible steps. The destination is positional, as for `export`.
+
+**`--yes-i-want-to-publish` is required.** Local-only is the default, and
+`publish` is the only path that writes outside `.sdd/runtime/`. Without the flag
+it refuses and exits 2. The flag is scoped to this verb: passing it to `export`,
+`verify` or any other spelling is **refused by name**, not silently dropped.
+
+```bash
+# explicit destination
+bernstein replay publish backend-abc receipt.public.tar --yes-i-want-to-publish
+
+# default destination: .sdd/runtime/receipts/backend-abc.tar
+bernstein replay publish backend-abc --yes-i-want-to-publish
+```
+
+A published receipt is **not** a drop-in substitute for an exported one, in two
+ways worth knowing before you build a pipeline on it:
+
+- **It verifies against the *published* head, not the original.** Keeping the
+  export's `head_hash` to pin against is the correct instinct everywhere else,
+  but `bernstein replay verify <published> --head <original_head_hash>` fails a
+  perfectly good receipt, and the `ok: false` reads as tampering. Pin against
+  `head_hash` from the publish, and keep `original_head_hash` only for
+  correlating the two.
+- **It drops `blob_refs` and ships `blob_digests: []`**, where an exported
+  receipt keeps them. Redaction rewrites the payloads the chain is computed
+  over; that is what makes the head differ, and it is why the visible steps
+  still anchor while the blobs no longer resolve.
 
 ### `bernstein replay verify <RECEIPT>`
 
@@ -126,6 +197,14 @@ Offline verifier for an exported or published receipt. Recomputes the receipt's 
 
 ```bash
 bernstein replay verify receipt.json
+```
+
+### `bernstein replay repair <RUN_ID>`
+
+Truncate a crash-torn journal tail so a suspended task can resume. A crash partway through an append can leave the journal with a truncated final line (no trailing newline); the tolerant reader discards that line and `resume` refuses the journal. The repair removes exactly that trailing fragment -- the surviving head is unchanged byte for byte -- and reports a no-op on a clean journal. It refuses (without writing) a discard in the middle of the file (corruption, not a torn write) and a truncation that would contradict an external seal.
+
+```bash
+bernstein replay repair run-20260816-1015
 ```
 
 ---

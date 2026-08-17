@@ -18,9 +18,12 @@ name: Adapter contract drift
 #
 # Triggers:
 #   * Once daily on schedule so upstream releases surface within 24h.
-#   * On PRs touching adapters or contracts so contract edits get
-#     validated immediately.
 #   * Manual dispatch for operator-driven re-runs.
+#   * NOT on merge_group. Only `CI gate` is required there, so this lane
+#     never gated a queue merge; it competed with ci.yml for runners on
+#     every queue entry and reshuffle. Upstream drift is a function of
+#     upstream releases, not of what a queue entry changes - the daily
+#     schedule is the right cadence for it.
 
 on:
   schedule:
@@ -30,11 +33,6 @@ on:
     # enough to justify three sweeps a day; workflow_dispatch covers an
     # immediate re-check after a known upstream release.
     - cron: "0 6 * * *"
-  # Pre-merge validation runs on the merge queue's ephemeral branch instead
-  # of on every PR push. merge_group has no paths filter, so the full adapter
-  # matrix runs pre-merge; the daily cron still surfaces upstream CLI
-  # releases independent of any merge.
-  merge_group: {}
   workflow_dispatch:
 
 concurrency:
@@ -80,7 +78,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           # aider-chat does not yet support Python 3.14; pin the aider
           # matrix row to 3.13 until upstream lands 3.14 compatibility.

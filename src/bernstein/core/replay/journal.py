@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import logging
 import os
@@ -239,6 +240,26 @@ class JournalSeal:
 
 
 @dataclass(frozen=True, slots=True)
+class JournalRepairResult:
+    """Outcome of :func:`repair_journal_tail`.
+
+    Attributes:
+        repaired: ``True`` when a torn trailing fragment was truncated.
+        removed_line_indices: 0-based physical lines truncated away
+            (empty when the journal was clean).
+        event_count: Number of surviving events after repair (or before
+            it for a clean journal).
+        head: Surviving chain head after repair (or before it for a
+            clean journal).
+    """
+
+    repaired: bool
+    removed_line_indices: tuple[int, ...] = ()
+    event_count: int = 0
+    head: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class JournalVerifyResult:
     """Separate chain, reader-coverage, and sealed-identity verdicts.
 
@@ -278,6 +299,24 @@ class JournalVerifyResult:
     errors: list[str] = field(default_factory=list[str])
 
 
+#: Cheap identity-and-length token for a journal file: ``(st_ino, st_dev,
+#: st_size)``. Equality means "same file, same length".
+#:
+#: ``st_mtime_ns`` is deliberately *not* in here, and it was measured before
+#: it was left out. It would catch a same-length in-place rewrite only when
+#: the clock happened to tick between the two stats: on an ext4 tree the
+#: journal timestamp advances in ~1 ms steps, so 1859 of 2000 same-length
+#: rewrites produced a byte-identical ``st_mtime_ns``. A guard that fires 7%
+#: of the time is worse here than one that never fires, because it makes the
+#: failure irreproducible - a repairer author would test their repair, watch
+#: the count update by luck, and ship without the
+#: :meth:`EventJournal.invalidate_count` call that the other 93% needs. With
+#: the field left out the rule is flat and testable in both directions:
+#: anything that changes length or identity is caught, a same-length rewrite
+#: is never caught and must invalidate explicitly.
+_StatToken = tuple[int, int, int]
+
+
 class EventJournal:
     """Append-only Merkle-chained per-run event journal.
 
@@ -305,8 +344,21 @@ class EventJournal:
         # to sit under the runs root even when the run directory is a symlink.
         self._path = run_journal_path(sdd_dir, run_id)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        # Reentrant on purpose. ``record`` dispatches the post-append observer
+        # while still holding this lock (see :meth:`record`), and
+        # :meth:`event_count` must take it to read the count cache coherently.
+        # With a plain ``Lock`` an observer that asks the journal how many
+        # events it now holds - the obvious thing for a projection to do -
+        # deadlocks against its own append. Measured: the non-reentrant version
+        # of this change hangs that call permanently.
+        self._lock = threading.RLock()
         self._index = 0
+        # Cached ``(stat token, usable event count, tail ends with newline)``,
+        # or ``None`` for "not known". An absent file is never cached:
+        # :meth:`_stat_token` already recognises it in O(1). The third field
+        # is what makes the carry-forward in :meth:`record` safe over a
+        # crash-torn tail; see there. See :meth:`_stat_token`.
+        self._count_cache: tuple[_StatToken, int, bool] | None = None
         self._head = _GENESIS_HASH
         self._start_ts: float = time.time()
         self._observer: Callable[[dict[str, Any]], None] | None = None
@@ -343,6 +395,12 @@ class EventJournal:
         events = loaded.events
         if loaded.discarded_line_indices:
             joined = ", ".join(str(index) for index in loaded.discarded_line_indices)
+            tail = _torn_tail_indices(journal.path)
+            if tail:
+                raise ValueError(
+                    f"cannot resume journal {journal.path}: reader discarded physical line(s): {joined}; "
+                    f"the tail is a torn write — repair it first with 'bernstein replay repair {run_id}'"
+                )
             raise ValueError(f"cannot resume journal {journal.path}: reader discarded physical line(s): {joined}")
         if not events:
             return journal
@@ -402,6 +460,37 @@ class EventJournal:
                 excluded from the hash but kept on the row for operators.
         """
         with self._lock:
+            # Read the count the file holds *before* this append, but only
+            # when it is already known - never by scanning. A fresh journal
+            # whose file does not exist yet holds 0 events, which is knowable
+            # without touching the disk, so the common "construct, then append"
+            # path primes the cache on its first record and never scans at all.
+            #
+            # The carry is only sound when the file ends on a line boundary.
+            # ``open("a")`` resumes at the last byte, so appending to a
+            # crash-torn fragment glues the new row onto it and produces one
+            # unusable line where the arithmetic assumed two usable ones -
+            # ``prior + 1`` would then overcount for the rest of the journal's
+            # life. That state is reachable: the plain constructor accepts a
+            # torn file (only ``resume`` refuses one), so a scan can legally
+            # prime the cache from it. The damage is not bounded by one event
+            # either - a crash that lands between a complete row and its
+            # newline leaves a file the scan reports as *undamaged*, and
+            # gluing onto it destroys the row that was already there as well
+            # as miscounting the new one. See
+            # ``test_appending_to_a_newline_less_tail_does_not_destroy_a_row``.
+            prior: int | None = None
+            pre_token: _StatToken | None = None
+            try:
+                pre_token = self._stat_token()
+            except OSError:
+                pass  # unreadable: the count before this append is unknowable
+            else:
+                cached = self._count_cache
+                if cached is not None and cached[0] == pre_token and cached[2]:
+                    prior = cached[1]
+                elif pre_token is None:
+                    prior = 0
             index = self._index
             prev_hash = self._head
             p_hash = _payload_hash(event, data)
@@ -427,7 +516,15 @@ class EventJournal:
                     f.write(line + "\n")
             except OSError as exc:
                 logger.warning("EventJournal: failed to write event %r: %s", event, exc)
+                # The cache is deliberately left alone. A failed append either
+                # wrote nothing - in which case it is still correct - or left
+                # bytes behind, and an append cannot shrink a file, so those
+                # bytes move ``st_size`` and the next count rescans. Dropping
+                # it here would be a second mechanism for a case the token
+                # already covers, and mutation-testing confirms no behaviour
+                # distinguishes the two.
                 return
+            self._count_cache = self._cache_after_append(prior, pre_token, len((line + "\n").encode("utf-8")))
             self._index = index + 1
             self._head = e_hash
             # Dispatch while the append lock still establishes total order.
@@ -443,14 +540,162 @@ class EventJournal:
                     logger.warning("EventJournal observer failed for event %r: %s", event, exc)
 
     def event_count(self) -> int:
-        """Return the number of events recorded so far."""
-        if not self._path.exists():
-            return 0
+        """Return the number of events recorded so far.
+
+        The relationship to the other reader, in one sentence:
+        ``event_count() == len(load_events(path).events)``. Counting
+        *usable* events rather than physical lines is not a preference -
+        it is the only count the rest of the class already agrees with.
+        :meth:`resume` continues the chain from ``len(events)``, so a row
+        appended after a malformed one carries that index and not a line
+        number; the read side recovers the same value from the row's own
+        ``index`` field (``run_artifacts._row_to_record``). Every caller
+        spells this ``event_count() - 1`` to name the row it just wrote,
+        and a physical-line count would name a row that is not there.
+
+        Sharing the scan rather than re-implementing it is also what keeps
+        the two readers on one decode policy: a strict decode here made a
+        journal torn mid-character raise :class:`UnicodeDecodeError` out
+        of a method whose failure mode is documented as ``0``, because
+        that error derives from :class:`ValueError` and not from
+        :class:`OSError`. The handler below is now exactly what it says -
+        an unreadable file - since no decode error can reach it.
+
+        The scan itself costs a JSON parse per row where the old one cost
+        a strip, so this method caches its result and returns it in O(1)
+        for as long as the file is unchanged. The cache never weakens the
+        invariant above: it is keyed on a ``stat`` token and is dropped
+        the moment the file stops being the one that was counted.
+
+        **The one change this cannot see is an in-place rewrite that keeps
+        the byte length**, and it is not seen *deterministically* rather
+        than most of the time - see :data:`_StatToken` for why that is the
+        deliberate choice and for the measurement behind it. A repairer
+        that rewrites a row without changing its length must call
+        :meth:`invalidate_count`. Nothing in this tree rewrites a journal
+        in place today; the method exists so that whatever does can.
+        """
+        with self._lock:
+            try:
+                return self._count_locked()
+            except OSError:
+                self._count_cache = None
+                return 0
+
+    def invalidate_count(self) -> None:
+        """Drop the cached event count, forcing the next call to rescan.
+
+        Required after any in-place rewrite of the journal file that does
+        not change its length - a tail repair that substitutes bytes
+        rather than truncating, for instance. Every other mutation
+        (append, truncate, replace) moves ``st_size`` or the inode and is
+        caught without help; the same-length case is never caught, by
+        design, and :data:`_StatToken` records why.
+        """
+        with self._lock:
+            self._count_cache = None
+
+    def _stat_token(self) -> _StatToken | None:
+        """Return a cheap change token for the journal file.
+
+        Returns:
+            ``(st_ino, st_dev, st_size)``, or ``None`` when the file is
+            provably absent - which is a *known* count of zero, not an
+            unknown one.
+
+        Raises:
+            OSError: The file exists but could not be stat-ed. Left to the
+                caller so an unreadable journal keeps reporting ``0``
+                through the same handler as before rather than being
+                mistaken for an empty one.
+        """
         try:
-            with self._path.open(encoding="utf-8") as f:
-                return sum(1 for line in f if line.strip())
+            st = self._path.stat()
+        except FileNotFoundError:
+            return None
+        return (st.st_ino, st.st_dev, st.st_size)
+
+    def _tail_is_clean(self) -> bool:
+        """Whether the journal file ends on a line boundary.
+
+        An empty or absent file is clean - there is no partial row to glue
+        onto. Costs one seek and one byte, and is only paid on the scan
+        path, never per append.
+
+        This asks the *bytes*, not the scan, and the difference is load
+        bearing. A crash that lands between a complete row and its newline
+        leaves every line parsable, so the tolerant reader discards nothing
+        and reports a perfectly healthy file - the one torn state that
+        ``discarded_line_indices`` cannot see. Deriving the boundary from
+        the scan's own damage report would therefore reintroduce the worst
+        of the three divergences it exists to close.
+        """
+        try:
+            with self._path.open("rb") as handle:
+                if handle.seek(0, os.SEEK_END) == 0:
+                    return True
+                handle.seek(-1, os.SEEK_END)
+                return handle.read(1) == b"\n"
         except OSError:
+            return False
+
+    def _cache_after_append(
+        self,
+        prior: int | None,
+        pre_token: _StatToken | None,
+        written: int,
+    ) -> tuple[_StatToken, int, bool] | None:
+        """Pair ``prior + 1`` with the file's token, if this append explains it.
+
+        Returns ``None`` - "not known" - when the count before the append was
+        unknown, or when the file after the append is not exactly the file
+        before it plus *written* bytes. That last check is what keeps a
+        foreign append landing between the write and this stat from being
+        sealed under a token it does not describe: the mismatched entry would
+        otherwise be returned in O(1) forever, because it names the current
+        file and so never expires. It is the same conservative refusal
+        :meth:`_count_locked` makes after its scan, on the write side.
+        """
+        if prior is None:
+            return None
+        try:
+            token = self._stat_token()
+        except OSError:
+            return None
+        if token is None:
+            return None
+        expected_size = (pre_token[2] if pre_token is not None else 0) + written
+        if token[2] != expected_size:
+            return None
+        if pre_token is not None and token[:2] != pre_token[:2]:
+            return None
+        # This writer just terminated its own row, so the tail is a boundary.
+        return (token, prior + 1, True)
+
+    def _count_locked(self) -> int:
+        """Count usable events, from cache when the file has not moved.
+
+        Caller holds the lock.
+        """
+        token = self._stat_token()
+        cached = self._count_cache
+        if cached is not None and cached[0] == token:
+            return cached[1]
+        if token is None:
+            # Nothing to cache: a missing file is recognised by the token
+            # alone on every later call, without a scan, so an entry here
+            # could never be read. Mutation-tested - writing one changes
+            # no observable behaviour.
             return 0
+        count = len(load_events(self._path).events)
+        # Re-stat after the scan. A writer that appended *while* the scan
+        # was running would otherwise get a count from one version of the
+        # file sealed in under the token of another, and every later call
+        # would return that stale number in O(1). Unchanged across the
+        # scan means the count describes the file the token names.
+        clean = self._tail_is_clean()
+        self._count_cache = (token, count, clean) if self._stat_token() == token else None
+        return count
 
     def verify(self) -> JournalVerifyResult:
         """Recompute the parsed chain and report the first divergent step.
@@ -516,6 +761,30 @@ class JournalParseError(ValueError):
     """
 
 
+def _is_decodable(line: str) -> bool:
+    """Whether *line* came back from a lossless UTF-8 decode.
+
+    ``load_events`` decodes with ``errors="surrogateescape"``, which maps each
+    undecodable byte to a lone surrogate in U+DC80..U+DCFF rather than raising.
+    Those code points cannot be encoded back to UTF-8, so a failed re-encode is
+    an exact test for "this physical line held bytes that are not UTF-8" - and
+    it is exact in the other direction too: no lossless decode can produce a
+    lone surrogate, because UTF-8 cannot carry one.
+
+    The ASCII fast path matters rather than being decoration. Every row this
+    package writes is ASCII (``json.dumps`` escapes non-ASCII by default), so
+    ``str.isascii`` - a flag lookup on CPython, not a scan - answers for the
+    whole journal in the common case and no line is encoded twice.
+    """
+    if line.isascii():
+        return True
+    try:
+        line.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def load_events(path: Path, *, strict: bool = False) -> JournalLoadResult:
     """Load all events from a journal JSONL file in append order.
 
@@ -529,15 +798,37 @@ def load_events(path: Path, *, strict: bool = False) -> JournalLoadResult:
       line index. Diagnostic readers (``bernstein audit diagnose``) use this
       so no reported index can ever count parsed rows rather than physical
       journal lines, and no finding is derived from a filtered sequence.
+
+    "Malformed" includes *undecodable*. A crash partway through an append can
+    land inside a multi-byte character as easily as between two, and a strict
+    decode would make the same class of crash produce two different outcomes
+    depending on where in the byte stream it stopped: a discarded line index
+    in one case, a bare ``UnicodeDecodeError`` out of the reader in the other.
+    Bytes that are not valid UTF-8 are therefore surfaced through the same two
+    policies as unparsable JSON - discarded by the tolerant reader, raised as
+    :class:`JournalParseError` naming the physical line by the strict one.
     """
     events: list[dict[str, Any]] = []
     discarded: list[int] = []
     if not path.exists():
         return JournalLoadResult(events=events)
-    with path.open(encoding="utf-8") as f:
+    # Binary handle, decoded through the *same* TextIOWrapper machinery as
+    # ``path.open(encoding="utf-8")``: universal-newline splitting is what
+    # defines a physical line here, and re-implementing it over bytes would
+    # silently renumber every index this function reports (a lone ``\r`` ends
+    # a line in text mode and does not in ``bytes.split(b"\n")``). Only the
+    # error policy changes. ``surrogateescape`` rather than ``replace``
+    # because it is reversible: a caller inspecting or repairing a torn tail
+    # still has the original bytes, which ``replace`` would destroy.
+    with path.open("rb") as raw_file, io.TextIOWrapper(raw_file, encoding="utf-8", errors="surrogateescape") as f:
         for lineno, raw in enumerate(f):
             line = raw.strip()
             if not line:
+                continue
+            if not _is_decodable(line):
+                if strict:
+                    raise JournalParseError(f"undecodable bytes at physical line {lineno} (not valid UTF-8)")
+                discarded.append(lineno)
                 continue
             try:
                 decoded: object = json.loads(line)
@@ -556,6 +847,152 @@ def load_events(path: Path, *, strict: bool = False) -> JournalLoadResult:
                 _validate_strict_row(row, lineno)
             events.append(row)
     return JournalLoadResult(events=events, discarded_line_indices=tuple(discarded))
+
+
+def _torn_tail_indices(path: Path) -> tuple[int, ...]:
+    """Return the trailing-fragment physical lines, or ``()`` if none.
+
+    A torn write truncates the *last* line and nothing else: the final
+    physical line is unparsable and every discarded line is at the end
+    of the file. A discard anywhere before the last non-blank line is
+    corruption (a hole in the middle of the journal), which must never
+    share the repair code path.
+
+    Returns a tuple of 0-based physical line indices that can be
+    truncated away, or ``()`` when the journal has nothing to repair.
+    """
+    loaded = load_events(path)
+    discarded = loaded.discarded_line_indices
+    if not discarded:
+        return ()
+    # The discarded lines must be a *trailing* run: the last discarded
+    # index must be the last physical line of the file, and no discarded
+    # index may be followed by a line that the tolerant reader accepted.
+    # We re-read the physical lines to answer "is this the tail" without
+    # re-parsing (the issue's "answerable without a second scan" promise
+    # is about parsing; counting lines is cheap and exact).
+    # ``errors="surrogateescape"`` matches the decode policy the tolerant
+    # reader uses. A tear in the middle of a multi-byte character is one
+    # of the two shapes this function exists to identify, and a strict
+    # decode raises UnicodeDecodeError on it -- which derives from
+    # ValueError, so ``except OSError`` would not catch it and the
+    # function would propagate instead of reporting the tail. Widening
+    # the except clause is the wrong fix: it returns "nothing to repair"
+    # for exactly the journal that needs repairing.
+    try:
+        with path.open(encoding="utf-8", errors="surrogateescape") as f:
+            physical_lines = f.readlines()
+    except OSError:
+        return ()
+    last_physical = len(physical_lines) - 1
+    if max(discarded) != last_physical:
+        return ()
+    discarded_set = set(discarded)
+    # Every line after the first discarded index must be discarded too;
+    # otherwise a readable line sits between fragments (corruption).
+    for lineno in range(min(discarded), last_physical + 1):
+        if lineno not in discarded_set:
+            return ()
+    return tuple(discarded)
+
+
+def repair_journal_tail(
+    path: Path,
+    *,
+    seal: JournalSeal | None = None,
+) -> JournalRepairResult:
+    """Truncate a crash-torn trailing fragment so the journal can resume.
+
+    A crash partway through appending leaves a truncated final line with
+    no trailing newline. ``EventJournal.resume`` refuses such a journal
+    (its tolerant read discarded the physical line), and with no repair
+    path the task would be unresumable for good. This repairs exactly
+    that one failure mode: it truncates the trailing fragment and
+    nothing else, restoring byte-for-byte the prefix the surviving chain
+    head already commits to.
+
+    The repair is conservative:
+
+    * a discard anywhere but the end of the file is corruption, not a
+      torn write, and is refused with a different message;
+    * if an external seal exists and the truncated journal would not
+      match it, the repair is refused *before* any write, so the
+      evidence survives;
+    * a journal with nothing to truncate reports a no-op.
+
+    Args:
+        path: Path to a ``journal.jsonl`` file.
+        seal: Optional independent finished-journal commitment. When
+            given, the truncated result must match it or the repair is
+            refused before writing.
+
+    Returns:
+        A :class:`JournalRepairResult` describing what was done.
+
+    Raises:
+        ValueError: The discarded lines are not a trailing fragment
+            (corruption), or the truncated result would not match
+            *seal*.
+    """
+    loaded = load_events(path)
+    discarded = loaded.discarded_line_indices
+    if not discarded:
+        events = loaded.events
+        head = str(events[-1].get("event_hash", "")) if events else ""
+        return JournalRepairResult(
+            repaired=False,
+            event_count=len(events),
+            head=head,
+        )
+
+    torn = _torn_tail_indices(path)
+    if not torn:
+        joined = ", ".join(str(index) for index in discarded)
+        raise ValueError(
+            f"refusing repair of {path}: reader discarded physical line(s) {joined} "
+            "in the middle of the journal (corruption, not a torn write); "
+            "repair truncates only a trailing fragment"
+        )
+
+    events = loaded.events
+    surviving_head = str(events[-1].get("event_hash", "")) if events else ""
+    surviving_count = len(events)
+    if seal is not None and (surviving_head != seal.head or surviving_count != seal.event_count):
+        raise ValueError(
+            f"refusing repair of {path}: truncated journal (head={surviving_head or '(empty)'}, "
+            f"events={surviving_count}) does not match the external seal "
+            f"(head={seal.head or '(empty)'}, events={seal.event_count}); "
+            "the journal is sealed and this command is not its authority"
+        )
+
+    # Truncate to just before the first discarded physical line. Every
+    # byte up to that line belongs to the surviving chain, so the prefix
+    # is restored exactly (issue: "removing it restores exactly the
+    # bytes the surviving head already commits to").
+    #
+    # os.truncate() is a single metadata operation that never rewrites
+    # the surviving bytes. Reading the prefix and writing it back would
+    # open the file with "w", zeroing it before the rewrite: a crash in
+    # that window destroys a journal whose only damage was a torn tail,
+    # which is the failure this command exists to repair. Counting the
+    # cut in bytes also avoids a decode/encode round-trip of bytes that
+    # are supposed to come through untouched.
+    raw = path.read_bytes()
+    cut = 0
+    for _ in range(min(torn)):
+        newline = raw.find(b"\n", cut)
+        if newline == -1:
+            cut = len(raw)
+            break
+        cut = newline + 1
+    os.truncate(path, cut)
+
+    return JournalRepairResult(
+        repaired=True,
+        removed_line_indices=torn,
+        event_count=surviving_count,
+        head=surviving_head,
+    )
 
 
 def _validate_strict_row(row: dict[str, Any], lineno: int) -> None:

@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, get_args, get_type_hints
 
 import pytest
 from bernstein.core.agent_identity import (
+    _CREDENTIAL_TOKEN_TYPES,
     AgentCredential,
     AgentIdentity,
     AgentIdentityStatus,
     AgentIdentityStore,
     IdentityAuditEvent,
+    TokenType,
     _hash_token,
     permissions_for_role,
 )
@@ -441,6 +443,120 @@ class TestAgentCredentialTenantDeserialization:
 
         assert identity.id in listed
         assert "session-corrupt" not in listed
+
+
+class TestAgentCredentialTokenTypeDeserialization:
+    """The persisted ``token_type`` selects which validation a token gets.
+
+    ``_validate_jwt_claims`` refuses any credential that does not say
+    ``"jwt"``, so an unrecognised kind is not inert - it routes the token to
+    the opaque hash comparison instead of being refused.  ``from_dict``
+    establishes the value as one of the two real kinds rather than coercing
+    whatever was on disk into one that some comparison will happen to accept.
+    """
+
+    def test_absent_token_type_resolves_to_opaque(self) -> None:
+        """Records written before the field existed still load."""
+        credential = AgentCredential.from_dict({"token_hash": "abc"})
+
+        assert credential.token_type == "opaque"
+
+    @pytest.mark.parametrize("stored", ["opaque", "jwt"])
+    def test_both_kinds_round_trip_unchanged(self, stored: str) -> None:
+        credential = AgentCredential.from_dict({"token_hash": "abc", "token_type": stored})
+
+        assert credential.token_type == stored
+        assert AgentCredential.from_dict(credential.to_dict()).token_type == stored
+
+    @pytest.mark.parametrize("stored", ["anything", "JWT", "opaque ", "", None, 1, True, [], {}])
+    def test_unknown_token_type_is_refused_and_named(self, stored: object) -> None:
+        """The message names the offending value, so the record is findable.
+
+        A store holding one bad record is repaired by locating it; a refusal
+        that only names the field leaves every credential a suspect.
+
+        The last two cases are the reason the membership test is guarded by
+        ``isinstance``: a list and an object are the only two values JSON can
+        persist that a set lookup cannot hash, so without the guard they
+        raise ``TypeError: unhashable type`` from the lookup rather than the
+        named ``ValueError``.  Both are here rather than one, because they
+        are two different unhashable shapes and a guard covering one is not
+        evidence about the other.
+        """
+        with pytest.raises(ValueError, match="token_type") as excinfo:
+            AgentCredential.from_dict({"token_hash": "abc", "token_type": stored})
+
+        assert repr(stored) in str(excinfo.value)
+
+    def test_unknown_token_type_does_not_authenticate(self, tmp_path: Path) -> None:
+        """The refusal reaches authentication as a miss, not as a 500.
+
+        Before this change the record loaded, ``token_type != "jwt"`` sent it
+        down the opaque branch, and the identity authenticated on its token
+        hash alone.  The refusal now travels the same path an unusable
+        ``tenant_id`` already does - through ``_load``, which skips the file.
+        """
+        import json
+
+        store = AgentIdentityStore(tmp_path)
+        identity, token = store.create_identity("session-jwt", "backend")
+        path = tmp_path / "agent_identities" / f"{identity.id}.json"
+        payload = json.loads(path.read_text())
+        assert payload["credential"]["token_type"] == "jwt"
+        payload["credential"]["token_type"] = "anything"
+        path.write_text(json.dumps(payload))
+
+        assert store.authenticate(token) is None
+        assert [found.id for found in store.list_identities()] == []
+
+
+class TestTokenTypeAllowlistIsDerivedNotRestated:
+    """The allowlist and the annotation are one source of truth, not two.
+
+    The refactor these tests guard (#4015) replaced a hand-written
+    ``frozenset`` with :func:`typing.get_args` over :data:`TokenType`. The
+    behaviour is unchanged, so the deserialisation tests above cannot tell
+    the two apart - they pass either way. What is new is the *property*, and
+    a property nothing asserts is one refactor away from being lost again.
+
+    The failure being pinned is quiet: restate the pair on the annotation,
+    add a kind there, and the type permits a value the boundary refuses.
+    Nothing raises, mypy stays green, and the disagreement only surfaces at
+    the far end of a stack trace.
+    """
+
+    def test_the_runtime_allowlist_comes_from_the_type(self) -> None:
+        """A hand-written copy would satisfy today and drift tomorrow."""
+        assert tuple(_CREDENTIAL_TOKEN_TYPES) == get_args(TokenType)
+
+    def test_the_field_annotation_denotes_the_same_type(self) -> None:
+        """The field and the allowlist must not come to permit different sets.
+
+        Worth being exact about what this catches, since ``Literal`` interns
+        its instances: a field that spells the same two values out again *is*
+        :data:`TokenType`, and this passes. That is not a gap - an identical
+        restatement denotes the same type and cannot disagree with it.
+
+        What it catches is the edit that matters. Add a kind to the field and
+        not to :data:`TokenType` and the annotations are different objects,
+        so this fails - which is the case where the type permits a value the
+        boundary refuses.
+        """
+        annotation = get_type_hints(AgentCredential)["token_type"]
+
+        assert annotation is TokenType
+
+    def test_every_declared_kind_is_admitted(self) -> None:
+        """Whatever the type permits, the boundary accepts - by construction.
+
+        Parametrising over ``get_args`` rather than a written-out list is the
+        point: a kind added to :data:`TokenType` is covered here the moment
+        it exists, without anyone remembering to extend this test.
+        """
+        for kind in get_args(TokenType):
+            credential = AgentCredential.from_dict({"token_hash": "abc", "token_type": kind})
+
+            assert credential.token_type == kind
 
 
 class TestCorruptIdentityDoesNotBreakAuthentication:

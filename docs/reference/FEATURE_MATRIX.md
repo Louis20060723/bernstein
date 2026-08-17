@@ -106,6 +106,7 @@ test, and a row naming a command the CLI no longer registers fails it too.
 | Agent trust tiers | Brief | 3 | `bernstein agents trust`; tiers accrue from task outcomes in `.sdd/trust/` and map to an `AgentPermissions` profile (`core/agents/agent_trust.py`) |
 | [Volunteer project manifest](volunteer-manifest.md) | Full | 3 | A project's opt-in policy — OSI licence, acceptance gates, path scope, egress, sandbox floor — loaded and content-addressed by `core/volunteer/manifest.py`; validate one with `bernstein volunteer verify` |
 | [Volunteer sandbox profile](volunteer-sandbox.md) | Full | 3 | Deny-all-egress containment derived from the manifest and the donor's own limits; refusals are records, not log lines (`core/volunteer/sandbox_profile.py`) |
+| [Volunteer issue text](volunteer-issue-text.md) | Full | 3 | Untrusted issue title and body normalised into one delimited block before it becomes an agent prompt — HTML comments (closed and unterminated) stripped, invisible and bidirectional characters dropped, NFKC, and a content-derived fence the text cannot forge (`core/volunteer/issue_sanitize.py`) |
 
 ## Verifiability and provenance
 
@@ -299,7 +300,7 @@ test, and a row naming a command the CLI no longer registers fails it too.
 | [`bernstein governance verify`](../operations/governance.md) | Full | 3 | Recompute access and budget verdicts for a run |
 | [`bernstein webhook verify`](../operations/webhook-node.md) | Full | 3 | Recompute inbound-event and outbound webhook-node hashes |
 | [`bernstein review-receipt emit/verify`](../operations/review-receipts.md) | Full | 3 | Bind and offline-verify PR review receipts (issue + plan + tool calls + diff) |
-| `bernstein receipt create/verify` | Brief | 3 | Sign a result receipt bundle from a JSON spec and verify one offline; `--pubkey` pins the worker key, `--prev-digest` asserts chain continuity, and without `--pubkey` the embedded key is trusted on first use. The group has no reference page of its own; `cli-reference.md` and `bernstein receipt --help` carry it |
+| `bernstein receipt create/verify` | Brief | 3 | Sign a result receipt bundle from a JSON spec and verify one offline; `--pubkey` pins the worker key, `--prev-digest` asserts chain continuity, `--expected-manifest-digest` ties the run to a declared volunteer policy (and `create --manifest-repo` derives that digest from the project's manifest rather than the spec), and without `--pubkey` the embedded key is trusted on first use. Verification reports, for the manifest digest and for chain continuity independently, whether the value was checked or merely carried, so a bare `✓` is not read as a policy check. The group has no reference page of its own; `cli-reference.md` and `bernstein receipt --help` carry it |
 | [`bernstein escalation show/verify`](../operations/stall-escalation.md) | Full | 3 | Project and reconstruct escalation receipts from the journal |
 | [`bernstein supervisor status/escalate`](../api/supervisor.md) | Full | 3 | Supervise stalled workers and seal stall escalation receipts |
 | [`bernstein delegation verify`](../operations/delegation-verify.md) | Full | 4 | Reconstruct and verify a run's delegation chain |

@@ -31,7 +31,12 @@ envelope dataclasses so the wire format matches the rest of the audit surface.
 3. the patch hashes to its attested value;
 4. every gate log hashes to its attested digest;
 5. the chain link is well formed (and matches an expected predecessor when the
-   caller walks a sequence).
+   caller walks a sequence);
+6. the manifest digest matches the one the caller expects, when it names one --
+   the only step that ties the run to the project's declared policy rather than
+   to a policy the worker chose (#3911). The verdict records whether that
+   comparison happened, because a field carried unchecked is not a field
+   verified.
 
 Tampering with any byte of the patch or any gate log fails verification with a
 field-level error, per the issue's acceptance criteria. HMAC audit-chain
@@ -43,6 +48,7 @@ does not require it.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -69,6 +75,8 @@ if TYPE_CHECKING:
         Ed25519PrivateKey,
         Ed25519PublicKey,
     )
+
+    from bernstein.core.volunteer.manifest import VolunteerManifest
 
 #: Predicate type for a result receipt bundle. Distinct from the audit
 #: predicate so a verifier cannot confuse the two envelope kinds.
@@ -223,6 +231,24 @@ class ResultBundle:
 # --------------------------------------------------------------------------- #
 
 
+def bundle_with_manifest_digest(bundle: ResultBundle, manifest: VolunteerManifest) -> ResultBundle:
+    """Return *bundle* carrying the real digest of *manifest*.
+
+    Whatever the caller put in ``manifest_sha256`` is discarded rather than
+    trusted, which is the only way the field can stop being an opaque string
+    the submitter chose. ``manifest.digest`` is the single producer of that
+    value (:mod:`bernstein.core.volunteer.manifest`), so a bundle built through
+    this helper and a verifier holding the same manifest agree by construction.
+
+    This is hygiene, not enforcement: a worker who points the helper at a
+    manifest they wrote still gets a bundle that is internally consistent. The
+    tie to the *project's* declared policy is made at verification time, by a
+    caller passing ``expected_manifest_sha256`` to
+    :func:`verify_result_bundle`. See that function's note.
+    """
+    return dataclasses.replace(bundle, manifest_sha256=manifest.digest)
+
+
 def build_result_bundle(
     bundle: ResultBundle,
     *,
@@ -286,13 +312,34 @@ class FieldError:
 
 @dataclass(frozen=True, slots=True)
 class BundleVerification:
-    """Outcome of :func:`verify_result_bundle`."""
+    """Outcome of :func:`verify_result_bundle`.
+
+    ``manifest_digest_checked`` is the difference between "the manifest digest
+    matched what I expected" and "nobody asked". Without it a caller reading
+    ``ok is True`` cannot tell the two apart -- the bundle carries the field
+    either way, and an unchecked field reported as verified is the whole defect
+    #3911 closes.
+
+    ``prev_digest_checked`` says the same thing about chain continuity, and
+    #4050 is that defect one field over: a caller who walked a sequence and a
+    caller who never asked used to get verdicts that compared equal.
+
+    The two are recorded differently on purpose, and the asymmetry is the
+    point. The manifest comparison is unconditional -- reaching the end of the
+    function means it ran -- so ``expected_manifest_sha256 is not None`` is
+    exactly true. Continuity is the last arm of an ``elif`` chain, so supplying
+    ``expected_prev_digest`` does *not* imply the anchor was ever looked at.
+    Never assert them as a single "something was checked" condition: they
+    answer different questions and are computed from different facts.
+    """
 
     ok: bool
     keyid: str = ""
     digest: str = ""
     bundle: dict[str, Any] = field(default_factory=dict)
     errors: tuple[FieldError, ...] = ()
+    manifest_digest_checked: bool = False
+    prev_digest_checked: bool = False
 
 
 def verify_result_bundle(
@@ -300,6 +347,7 @@ def verify_result_bundle(
     public_key: Ed25519PublicKey,
     *,
     expected_prev_digest: str | None = None,
+    expected_manifest_sha256: str | None = None,
 ) -> BundleVerification:
     """Offline, side-effect-free verification of a result receipt bundle.
 
@@ -312,10 +360,24 @@ def verify_result_bundle(
     4. the patch hashes to its attested ``patch_sha256``;
     5. every gate log hashes to its attested ``log_sha256``;
     6. the chain link is well formed, and matches ``expected_prev_digest`` when
-       the caller is walking a sequence.
+       the caller is walking a sequence;
+    7. the manifest digest matches ``expected_manifest_sha256`` when the caller
+       supplies one.
 
     A single wrong byte in the patch or any gate log yields a field-level error
     naming exactly what diverged.
+
+    Step 7 is what ties a run to a policy. Everything above it says the bundle
+    was not altered and that the worker signed it; none of it says *which rules
+    the run obeyed*, because the worker chose ``manifest_sha256`` too. Passing
+    ``expected_manifest_sha256`` -- the digest of the manifest the project
+    declared -- is the only step that answers that, so the result records
+    whether it happened rather than leaving a caller to infer it from ``ok``.
+
+    Step 6 records ``prev_digest_checked`` for the same reason and by a
+    different route: a caller walking a sequence needs to know its continuity
+    question was answered, not merely asked, and a malformed chain link skips
+    the comparison without failing on the caller's behalf.
     """
     errors: list[FieldError] = []
 
@@ -330,7 +392,16 @@ def verify_result_bundle(
 
     statement = env_v.statement
     predicate = statement.get("predicate", {})
-    bundle_dict = predicate.get("bundle", {})
+    raw_bundle = predicate.get("bundle", {})
+    bundle_dict = raw_bundle if isinstance(raw_bundle, dict) else {}
+    if not isinstance(raw_bundle, dict):
+        errors.append(
+            FieldError(
+                "bundle",
+                f"expected an object, got {type(raw_bundle).__name__}",
+            )
+        )
+
     subjects = statement.get("subject", [])
     attested_digest = ""
     if subjects and isinstance(subjects[0], dict):
@@ -338,7 +409,7 @@ def verify_result_bundle(
 
     # (2) internal hash consistency: the embedded bundle must reproduce the
     # subject digest byte-for-byte.
-    recomputed = _sha256_hex(canonical_bytes(bundle_dict))
+    recomputed = _sha256_hex(canonical_bytes(raw_bundle))
     if recomputed != attested_digest:
         errors.append(
             FieldError(
@@ -349,7 +420,14 @@ def verify_result_bundle(
 
     # (3) the signer is the worker the bundle names.
     worker = bundle_dict.get("worker", {})
-    if worker.get("keyid") and env_v.keyid and worker["keyid"] != env_v.keyid:
+    if not isinstance(worker, dict):
+        errors.append(
+            FieldError(
+                "worker",
+                f"expected an object, got {type(worker).__name__}",
+            )
+        )
+    elif worker.get("keyid") and env_v.keyid and worker["keyid"] != env_v.keyid:
         errors.append(
             FieldError(
                 "worker.keyid",
@@ -359,42 +437,111 @@ def verify_result_bundle(
 
     # (4) patch integrity.
     patch = bundle_dict.get("patch", "")
-    attested_patch = bundle_dict.get("patch_sha256", "")
-    actual_patch = _sha256_hex(patch.encode("utf-8"))
-    if actual_patch != attested_patch:
+    if not isinstance(patch, str):
         errors.append(
             FieldError(
                 "patch",
-                f"patch hashes to {actual_patch}, bundle attests {attested_patch}",
+                f"expected a string, got {type(patch).__name__}",
             )
         )
-
-    # (5) gate-log integrity, per gate.
-    for index, gate in enumerate(bundle_dict.get("gates", [])):
-        log = gate.get("log", "")
-        attested_log = gate.get("log_sha256", "")
-        actual_log = _sha256_hex(log.encode("utf-8"))
-        if actual_log != attested_log:
+    else:
+        attested_patch = bundle_dict.get("patch_sha256", "")
+        actual_patch = _sha256_hex(patch.encode("utf-8"))
+        if actual_patch != attested_patch:
             errors.append(
                 FieldError(
-                    f"gates[{index}].log",
-                    f"log for {gate.get('command', '?')!r} hashes to {actual_log}, bundle attests {attested_log}",
+                    "patch",
+                    f"patch hashes to {actual_patch}, bundle attests {attested_patch}",
                 )
             )
 
-    # (6) chain link shape and, optionally, continuity with a predecessor.
-    chain = bundle_dict.get("chain", {})
-    if "anchor" not in chain or "length" not in chain:
-        errors.append(FieldError("chain", "missing anchor or length"))
-    elif not isinstance(chain.get("length"), int) or chain["length"] < 1:
-        errors.append(FieldError("chain.length", f"invalid length {chain.get('length')!r}"))
-    elif expected_prev_digest is not None and chain.get("anchor") != expected_prev_digest:
+    # (5) gate-log integrity, per gate.
+    gates = bundle_dict.get("gates", [])
+    if not isinstance(gates, list):
         errors.append(
             FieldError(
-                "chain.anchor",
-                f"anchor {chain.get('anchor')} does not link to predecessor {expected_prev_digest}",
+                "gates",
+                f"expected a list, got {type(gates).__name__}",
             )
         )
+    else:
+        for index, gate in enumerate(gates):
+            if not isinstance(gate, dict):
+                errors.append(
+                    FieldError(
+                        f"gates[{index}]",
+                        f"expected an object, got {type(gate).__name__}",
+                    )
+                )
+            else:
+                log = gate.get("log", "")
+                if not isinstance(log, str):
+                    errors.append(
+                        FieldError(
+                            f"gates[{index}].log",
+                            f"expected a string, got {type(log).__name__}",
+                        )
+                    )
+                else:
+                    attested_log = gate.get("log_sha256", "")
+                    actual_log = _sha256_hex(log.encode("utf-8"))
+                    if actual_log != attested_log:
+                        errors.append(
+                            FieldError(
+                                f"gates[{index}].log",
+                                (
+                                    f"log for {gate.get('command', '?')!r} hashes to {actual_log}, "
+                                    f"bundle attests {attested_log}"
+                                ),
+                            )
+                        )
+
+    # (6) chain link shape and, optionally, continuity with a predecessor.
+    #
+    # ``prev_digest_checked`` is set inside the last arm rather than from
+    # ``expected_prev_digest is not None`` at the top, because a malformed
+    # chain link short-circuits the comparison: the caller asked, and the
+    # anchor was still never looked at. Recording the argument instead of the
+    # comparison would report continuity as confirmed on a bundle whose anchor
+    # is missing outright.
+    prev_digest_checked = False
+    chain = bundle_dict.get("chain", {})
+    if not isinstance(chain, dict):
+        # ``.get("chain", {})`` defends against the key being absent, not against
+        # it holding the wrong type, and the two tests below it change meaning
+        # rather than fail: ``in`` is substring on a str and element-of on a
+        # list, and ``.get`` exists on neither. The type has to be settled
+        # before the content is read at all.
+        errors.append(FieldError("chain", f"expected an object, got {type(chain).__name__}"))
+    elif "anchor" not in chain or "length" not in chain:
+        errors.append(FieldError("chain", "missing anchor or length"))
+    elif not isinstance(chain.get("length"), int) or isinstance(chain["length"], bool) or chain["length"] < 1:
+        # bool is an int subclass, so ``true`` satisfied both the isinstance and
+        # the ``>= 1`` comparison. Same rejection ``_load_version`` makes in
+        # bernstein.core.volunteer.manifest, for the same reason.
+        errors.append(FieldError("chain.length", f"invalid length {chain.get('length')!r}"))
+    elif expected_prev_digest is not None:
+        prev_digest_checked = True
+        if chain.get("anchor") != expected_prev_digest:
+            errors.append(
+                FieldError(
+                    "chain.anchor",
+                    f"anchor {chain.get('anchor')} does not link to predecessor {expected_prev_digest}",
+                )
+            )
+
+    # (7) the manifest the run declares itself bound to. Only compared when the
+    # caller names the manifest it expects: a bundle is self-consistent about
+    # this field no matter what it holds, so "carried" is not "checked".
+    if expected_manifest_sha256 is not None:
+        carried = bundle_dict.get("manifest_sha256")
+        if carried != expected_manifest_sha256:
+            errors.append(
+                FieldError(
+                    "manifest_sha256",
+                    f"bundle attests manifest {carried}, expected {expected_manifest_sha256}",
+                )
+            )
 
     return BundleVerification(
         ok=not errors,
@@ -402,6 +549,14 @@ def verify_result_bundle(
         digest=attested_digest,
         bundle=bundle_dict,
         errors=tuple(errors),
+        # Set here rather than at the top of the function on purpose: the
+        # signature failure above returns early, and a check that never ran
+        # must not be reported as one that passed.
+        manifest_digest_checked=expected_manifest_sha256 is not None,
+        # Carried out of step (6) rather than derived from the argument here:
+        # unlike the manifest comparison, this one can be skipped without
+        # returning. See BundleVerification's docstring.
+        prev_digest_checked=prev_digest_checked,
     )
 
 
