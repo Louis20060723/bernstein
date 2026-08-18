@@ -80,13 +80,9 @@ def make_rendering_fetcher() -> Callable[[str], bytes]:
         except RenderingFetchError:
             raise
         except Exception as exc:  # playwright raises several ad-hoc error types
-            raise RenderingFetchError(
-                f"failed to render {source_ref!r}: {exc}"
-            ) from exc
+            raise RenderingFetchError(f"failed to render {source_ref!r}: {exc}") from exc
         if not rendered:
-            raise RenderingFetchError(
-                f"rendering {source_ref!r} produced empty content"
-            )
+            raise RenderingFetchError(f"rendering {source_ref!r} produced empty content")
         return rendered
 
     return fetch
@@ -111,6 +107,4 @@ def _render(playwright_api: type, source_ref: str) -> bytes:
 
     # Wall-clock cap: a hung render must surface as a typed refusal, not a
     # worker that blocks forever on a single source.
-    return asyncio.run(asyncio.wait_for(_once(), timeout=45.0)).encode(
-        "utf-8", errors="replace"
-    )
+    return asyncio.run(asyncio.wait_for(_once(), timeout=45.0)).encode("utf-8", errors="replace")
