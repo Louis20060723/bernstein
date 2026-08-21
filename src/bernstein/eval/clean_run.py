@@ -105,8 +105,6 @@ _NORMALIZE_RE = re.compile(r"[^a-z0-9_./-]+")
 
 #: Closed set of journal payload fields treated as scannable content spans.
 _SPAN_FIELDS = ("content_window", "content", "arguments", "command")
-#: Closed set of journal payload fields naming an accessed filesystem path
-#: (shared single source: :data:`bernstein.core.replay.journal.PATH_FIELDS`).
 
 
 class CleanRunError(ValueError):

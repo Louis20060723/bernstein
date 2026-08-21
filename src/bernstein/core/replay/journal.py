@@ -88,6 +88,12 @@ _NON_DETERMINISTIC_FIELDS = frozenset({"ts", "elapsed_s", "index", "prev_hash", 
 #: derivation (:func:`bernstein.core.replay.read_paths.derive_read_paths`)
 #: so the closed set lives in exactly one place. Rows carrying one of these
 #: fields record which filesystem path the step touched.
+#:
+#: The two consumers read the set deliberately differently:
+#: ``clean_run.extract_activity`` takes only the *first* matching field per
+#: row (one activity record per row), while the read-path derivation
+#: collects *every* matching field (every path a row names is a path the
+#: run touched).
 PATH_FIELDS = ("path", "file_path")
 
 _GENESIS_HASH = ""

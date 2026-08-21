@@ -10,16 +10,20 @@ the chain head. This module composes the pieces that already exist:
 * the closed set of journal payload fields that name an accessed filesystem
   path is :data:`~.journal.PATH_FIELDS` (shared with clean-run attestation).
 
-The derivation is a pure function: same journal bytes, same worktree root,
-same result. It refuses on a broken chain or an unusable journal rather
-than returning a partial set -- a trimmed set would silently weaken the
-merge-admission check this feeds.
+The derivation is a pure function of the journal bytes and the worktree
+root *string*: classification is lexical (``normpath`` over the recorded
+path strings), so the result does not depend on filesystem state such as
+symlink targets, and an identical journal and root string always yield an
+identical result on any machine. It refuses on a broken chain or an
+unusable journal rather than returning a partial set -- a trimmed set
+would silently weaken the merge-admission check this feeds.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from bernstein.core.replay.journal import (
     PATH_FIELDS,
@@ -27,6 +31,9 @@ from bernstein.core.replay.journal import (
     load_events,
     verify_events,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class ReadPathDerivationError(ValueError):
@@ -37,12 +44,20 @@ class ReadPathDerivationError(ValueError):
 
     * :attr:`REASON_MISSING` - the journal file does not exist;
     * :attr:`REASON_EMPTY` - the journal exists but holds no rows;
+    * :attr:`REASON_MALFORMED` - the journal cannot be used as a source:
+      an unparsable row, or a path that cannot be read as a journal file
+      (a directory, a permission failure, or a file that vanished between
+      the existence check and the open);
     * :attr:`REASON_BROKEN_CHAIN` - rows do not recompute from genesis
-      (mutation, torn write, or any unparsable line under strict reading).
+      (mutation or a torn write). Kept apart from
+      :attr:`REASON_MALFORMED`: for merge admission, "your journal is
+      corrupt" and "your journal was tampered with" are the two verdicts
+      an operator most needs told apart.
     """
 
     REASON_MISSING = "journal_missing"
     REASON_EMPTY = "journal_empty"
+    REASON_MALFORMED = "malformed"
     REASON_BROKEN_CHAIN = "broken_chain"
 
     def __init__(self, reason: str, message: str) -> None:
@@ -79,9 +94,9 @@ def derive_read_paths(journal_path: Path, worktree_root: Path) -> ReadPathSet:
         The classified read-path set.
 
     Raises:
-        ReadPathDerivationError: The journal is missing, empty, or its
-            chain does not verify. The reason attribute distinguishes the
-            three cases. Never returns a partial set.
+        ReadPathDerivationError: The journal is missing, empty, unreadable,
+            or its chain does not verify. The reason attribute distinguishes
+            the cases. Never returns a partial set.
     """
     if not journal_path.exists():
         raise ReadPathDerivationError(
@@ -93,8 +108,17 @@ def derive_read_paths(journal_path: Path, worktree_root: Path) -> ReadPathSet:
         loaded = load_events(journal_path, strict=True)
     except JournalParseError as exc:
         raise ReadPathDerivationError(
-            ReadPathDerivationError.REASON_BROKEN_CHAIN,
+            ReadPathDerivationError.REASON_MALFORMED,
             f"journal contains an unparsable row: {exc}",
+        ) from exc
+    except OSError as exc:
+        # A directory, a permission failure, or a file that vanished between
+        # the existence check and the open: the path cannot be read as a
+        # journal file. Surface it through the documented contract rather
+        # than as a raw OSError.
+        raise ReadPathDerivationError(
+            ReadPathDerivationError.REASON_MALFORMED,
+            f"journal cannot be read: {exc}",
         ) from exc
 
     if not loaded.events:
@@ -111,7 +135,13 @@ def derive_read_paths(journal_path: Path, worktree_root: Path) -> ReadPathSet:
             f"journal chain does not verify: {detail}",
         )
 
-    root = worktree_root.resolve()
+    # Lexical classification only: normpath over the recorded strings, no
+    # filesystem consultation. Path.resolve() would follow symlinks and read
+    # live state, which would make the in-tree/out-of-tree split a function
+    # of the filesystem at derivation time - and a symlink flip could
+    # reclassify a row with no chain break at all, defeating the
+    # tamper-evidence the derivation is supposed to inherit.
+    root_norm = os.path.normpath(os.fspath(worktree_root))
     read_paths: set[str] = set()
     out_of_tree: set[str] = set()
     for row in loaded.events:
@@ -119,17 +149,29 @@ def derive_read_paths(journal_path: Path, worktree_root: Path) -> ReadPathSet:
             raw = row.get(field)
             if not isinstance(raw, str) or not raw:
                 continue
-            candidate = Path(raw)
-            if not candidate.is_absolute():
-                candidate = root / candidate
-            resolved = candidate.resolve()
+            candidate = os.path.normpath(
+                raw if os.path.isabs(raw) else os.path.join(root_norm, raw)
+            )
             try:
-                relative = resolved.relative_to(root)
-            except ValueError:
-                out_of_tree.add(resolved.as_posix())
+                relative = os.path.relpath(candidate, root_norm)
+            except ValueError:  # different drive on Windows: outside
+                out_of_tree.add(_posix(candidate))
             else:
-                read_paths.add(relative.as_posix())
+                if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+                    out_of_tree.add(_posix(candidate))
+                elif relative == os.curdir:
+                    # The row names the worktree root itself; "." is not a
+                    # repository path (the repo's own contained_subpath
+                    # refuses it too), so it is skipped.
+                    continue
+                else:
+                    read_paths.add(_posix(relative))
     return ReadPathSet(
         read_paths=frozenset(read_paths),
         out_of_tree=frozenset(out_of_tree),
     )
+
+
+def _posix(path: str) -> str:
+    """Render a normalized local path in POSIX form (``/`` separators)."""
+    return path.replace(os.sep, "/")

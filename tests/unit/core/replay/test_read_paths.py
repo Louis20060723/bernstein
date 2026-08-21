@@ -7,12 +7,15 @@ from anything the agent declares. These tests pin the derivation contract:
 * known rows yield exactly the expected worktree-relative POSIX path set;
 * a mutated row (byte flip in the file) raises the dedicated error instead
   of returning a smaller set;
+* an unparsable row raises the dedicated error with the malformed reason,
+  kept apart from the cryptographic (broken chain) verdict;
 * an absent or empty journal raises the dedicated error with a distinct
   reason;
 * a row naming a path outside the worktree root lands in the out-of-tree
   set, absent from the main set;
-* two calls over the same journal yield identical results (iteration-
-  independent equality).
+* derivation is a pure function of the journal and the root string: a
+  symlink mutation between two derivations over an unchanged journal does
+  not change the result, and insertion order does not matter.
 """
 
 from __future__ import annotations
@@ -106,6 +109,61 @@ def test_mutated_row_raises_dedicated_error_not_smaller_set(tmp_path: Path) -> N
     assert exc_info.value.reason == ReadPathDerivationError.REASON_BROKEN_CHAIN
 
 
+def test_unparsable_row_raises_malformed_reason(tmp_path: Path) -> None:
+    path = tmp_path / "bad.jsonl"
+    path.write_text("{not json}\n", encoding="utf-8")
+
+    with pytest.raises(ReadPathDerivationError) as exc_info:
+        derive_read_paths(path, tmp_path)
+
+    assert exc_info.value.reason == ReadPathDerivationError.REASON_MALFORMED
+
+
+def test_journal_path_pointing_at_directory_raises_dedicated_error(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ReadPathDerivationError) as exc_info:
+        derive_read_paths(tmp_path, tmp_path)
+
+    assert exc_info.value.reason == ReadPathDerivationError.REASON_MALFORMED
+
+
+def test_symlink_mutation_does_not_change_derivation(tmp_path: Path) -> None:
+    target_a = tmp_path / "a"
+    target_a.mkdir()
+    target_b = tmp_path / "b"
+    target_b.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(target_a, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation not permitted on this platform")
+    path = _journal(
+        tmp_path,
+        [
+            {"event": "read", "path": "src/foo.py"},
+            {"event": "read", "path": str(link / "bar.py")},
+        ],
+    )
+
+    first = derive_read_paths(path, tmp_path)
+    link.unlink()
+    link.symlink_to(target_b, target_is_directory=True)
+    second = derive_read_paths(path, tmp_path)
+
+    assert first == second
+    assert first.read_paths == frozenset({"src/foo.py", "link/bar.py"})
+
+
+def test_row_naming_worktree_root_itself_is_skipped(tmp_path: Path) -> None:
+    path = _journal(tmp_path, [{"event": "read", "path": str(tmp_path)}])
+
+    result = derive_read_paths(path, tmp_path)
+
+    assert result.read_paths == frozenset()
+    assert result.out_of_tree == frozenset()
+
+
 def test_absent_journal_raises_with_distinct_reason(tmp_path: Path) -> None:
     missing = tmp_path / "no" / "journal.jsonl"
 
@@ -141,18 +199,19 @@ def test_out_of_tree_path_lands_in_separate_set(tmp_path: Path) -> None:
     assert result.out_of_tree == frozenset({str(outside)})
 
 
-def test_determinism_two_calls_identical_results(tmp_path: Path) -> None:
-    path = _journal(
-        tmp_path,
-        [
-            {"event": "read", "path": "src/foo.py"},
-            {"event": "read", "path": "docs/bar.md"},
-        ],
+def test_determinism_across_insertion_orders(tmp_path: Path) -> None:
+    rows: list[dict[str, object]] = [
+        {"event": "read", "path": "src/foo.py"},
+        {"event": "read", "path": "docs/bar.md"},
+        {"event": "read", "path": str(tmp_path.parent / "outside" / "x.py")},
+    ]
+    first = derive_read_paths(_journal(tmp_path / "one", rows), tmp_path / "one")
+    second = derive_read_paths(
+        _journal(tmp_path / "two", list(reversed(rows))),
+        tmp_path / "two",
     )
 
-    first = derive_read_paths(path, tmp_path)
-    second = derive_read_paths(path, tmp_path)
-
-    assert first == second
-    assert first.read_paths == second.read_paths
-    assert first.out_of_tree == second.out_of_tree
+    assert (sorted(first.read_paths), sorted(first.out_of_tree)) == (
+        sorted(second.read_paths),
+        sorted(second.out_of_tree),
+    )
