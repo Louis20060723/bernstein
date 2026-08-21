@@ -149,9 +149,7 @@ def derive_read_paths(journal_path: Path, worktree_root: Path) -> ReadPathSet:
             raw = row.get(field)
             if not isinstance(raw, str) or not raw:
                 continue
-            candidate = os.path.normpath(
-                raw if os.path.isabs(raw) else os.path.join(root_norm, raw)
-            )
+            candidate = os.path.normpath(raw if os.path.isabs(raw) else os.path.join(root_norm, raw))
             try:
                 relative = os.path.relpath(candidate, root_norm)
             except ValueError:  # different drive on Windows: outside
