@@ -82,6 +82,14 @@ RETENTION_ENV_VAR = "BERNSTEIN_REPLAY_RETENTION"
 #: issue #1851).
 _NON_DETERMINISTIC_FIELDS = frozenset({"ts", "elapsed_s", "index", "prev_hash", "payload_hash", "event_hash"})
 
+#: Closed set of journal payload fields naming an accessed filesystem path.
+#:
+#: Shared with :mod:`bernstein.eval.clean_run` and the replay read-path
+#: derivation (:func:`bernstein.core.replay.read_paths.derive_read_paths`)
+#: so the closed set lives in exactly one place. Rows carrying one of these
+#: fields record which filesystem path the step touched.
+PATH_FIELDS = ("path", "file_path")
+
 _GENESIS_HASH = ""
 
 #: A run_id names exactly one journal directory and must be a single safe path
