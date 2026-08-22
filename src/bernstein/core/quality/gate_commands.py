@@ -219,9 +219,10 @@ class GateRunnerCommandsMixin:
         if baseline_score is None:
             return GateResult(
                 name=step.name,
-                status="warn",
+                status="inconclusive",
+                reason="evidence-missing",
                 required=step.required,
-                blocked=False,
+                blocked=step.required,
                 cached=False,
                 duration_ms=0,
                 details=f"Complexity average: {current_score:.2f}; baseline unavailable ({baseline_detail})",

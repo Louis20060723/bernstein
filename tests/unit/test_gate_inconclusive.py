@@ -180,6 +180,90 @@ class TestProducerPath:
         assert result.reason == "runner-died-before-output"
         assert result.blocked is True
 
+    def test_complexity_gate_missing_baseline_is_inconclusive(self, tmp_path: Path, monkeypatch) -> None:
+        """Missing baseline evidence is inconclusive, not a non-blocking warn.
+
+        Review (chernistry, PR #4282): the complexity gate's baseline
+        unavailable branch returned ``warn``/``blocked=False`` — a silent
+        downgrade that reads as "seen and non-blocking" rather than "not
+        evaluated". Issue #4181 opens with exactly this absent-evidence
+        shape. ``evidence-missing`` + blocked=required is the honest verdict.
+        """
+        config = QualityGatesConfig(
+            pipeline=[
+                GatePipelineStep(name="complexity_check", required=True, condition="python_changed"),
+            ],
+            complexity_check_command="radon cc",
+            cache_enabled=False,
+        )
+        runner = GateRunner(config, tmp_path)
+        monkeypatch.setattr(runner, "_measure_complexity_sync", lambda _cmd, _run_dir: (12.5, "ok"))
+        monkeypatch.setattr(runner, "_measure_complexity_base_sync", lambda _cmd: (None, "no baseline file"))
+        result = runner._run_complexity_gate_sync(
+            GatePipelineStep(name="complexity_check", required=True, condition="python_changed"),
+            tmp_path,
+            ["src/a.py"],
+        )
+        assert result.status == "inconclusive"
+        assert result.reason == "evidence-missing"
+        assert result.blocked is True
+        assert "baseline unavailable" in result.details
+
+    def test_complexity_gate_missing_baseline_optional_gate(self, tmp_path: Path, monkeypatch) -> None:
+        """At an optional gate, inconclusive does not block."""
+        config = QualityGatesConfig(
+            pipeline=[
+                GatePipelineStep(name="complexity_check", required=False, condition="python_changed"),
+            ],
+            complexity_check_command="radon cc",
+            cache_enabled=False,
+        )
+        runner = GateRunner(config, tmp_path)
+        monkeypatch.setattr(runner, "_measure_complexity_sync", lambda _cmd, _run_dir: (12.5, "ok"))
+        monkeypatch.setattr(runner, "_measure_complexity_base_sync", lambda _cmd: (None, "no baseline file"))
+        result = runner._run_complexity_gate_sync(
+            GatePipelineStep(name="complexity_check", required=False, condition="python_changed"),
+            tmp_path,
+            ["src/a.py"],
+        )
+        assert result.status == "inconclusive"
+        assert result.reason == "evidence-missing"
+        assert result.blocked is False
+
+    def test_command_could_not_run_is_inconclusive(self, tmp_path: Path) -> None:
+        """OSError from subprocess.run (tool could not start) is absent
+        evidence: inconclusive + evidence-missing, not fail."""
+        config = QualityGatesConfig(cache_enabled=False)
+        runner = GateRunner(config, tmp_path)
+        step = GatePipelineStep(name="lint", required=True, condition="python_changed")
+        result = runner._command_failure_result(
+            step, "Command error: [Errno 2] No such file or directory", "ruff check"
+        )
+        assert result.status == "inconclusive"
+        assert result.reason == "evidence-missing"
+        assert result.blocked is True
+
+    def test_command_real_failure_stays_fail(self, tmp_path: Path) -> None:
+        """Non-zero exit with captured output is a real (unfavourable)
+        verdict from a tool that ran — fail, not inconclusive."""
+        config = QualityGatesConfig(cache_enabled=False)
+        runner = GateRunner(config, tmp_path)
+        step = GatePipelineStep(name="lint", required=True, condition="python_changed")
+        result = runner._command_failure_result(step, "src/a.py:1:1 E501 line too long (89 > 88)", "ruff check")
+        assert result.status == "fail"
+        assert result.reason is None
+        assert result.blocked is True
+
+    def test_command_timeout_stays_timeout(self, tmp_path: Path) -> None:
+        """Timeout keeps its own verdict — unchanged by the inconclusive work."""
+        config = QualityGatesConfig(cache_enabled=False)
+        runner = GateRunner(config, tmp_path)
+        step = GatePipelineStep(name="lint", required=True, condition="python_changed")
+        result = runner._command_failure_result(step, "Timed out after 120s", "ruff check")
+        assert result.status == "timeout"
+        assert result.reason is None
+        assert result.blocked is True
+
 
 class TestConsumerScore:
     def test_points_for_status_bands(self, tmp_path: Path) -> None:

@@ -21,6 +21,9 @@ from bernstein.core.quality.gate_commands import (
     _resolve_import_from,
 )
 from bernstein.core.quality.gate_pipeline import (
+    COMMAND_ERROR_PREFIX as _COMMAND_ERROR_PREFIX,
+)
+from bernstein.core.quality.gate_pipeline import (
     NO_PYTHON_FILES as _NO_PYTHON_FILES,
 )
 from bernstein.core.quality.gate_pipeline import (
@@ -585,9 +588,10 @@ class GateRunner:
         if baseline_score is None:
             return GateResult(
                 name=step.name,
-                status="warn",
+                status="inconclusive",
+                reason="evidence-missing",
                 required=step.required,
-                blocked=False,
+                blocked=step.required,
                 cached=False,
                 duration_ms=0,
                 details=f"Complexity average: {current_score:.2f}; baseline unavailable ({baseline_detail})",
@@ -1213,6 +1217,28 @@ class GateRunner:
                 details=detail,
                 metadata={"command": command},
             )
+        if detail.startswith(_COMMAND_ERROR_PREFIX):
+            # The command could not be executed at all (OSError from
+            # subprocess.run: shell unavailable, cwd vanished, ...). No
+            # evidence was produced, so neither "pass" (a bypass) nor
+            # "fail" (a lie that trains operators to re-run until green)
+            # is honest — issue #4181. ``evidence-missing`` is the closed
+            # reason; at a required gate this blocks exactly like ``fail``.
+            return GateResult(
+                name=step.name,
+                status="inconclusive",
+                reason="evidence-missing",
+                required=step.required,
+                blocked=step.required,
+                cached=False,
+                duration_ms=0,
+                details=detail,
+                metadata={"command": command},
+            )
+        # Non-zero exit with captured output: the tool ran and reported a
+        # real failure — that is evidence, and it is unfavourable. ``fail``
+        # is the honest verdict here (distinct from the absent-evidence
+        # cases above, which carry ``inconclusive``).
         return GateResult(
             name=step.name,
             status="fail",

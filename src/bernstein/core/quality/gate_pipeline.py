@@ -7,6 +7,13 @@ from typing import TYPE_CHECKING, Any, Literal
 
 TIMED_OUT_PREFIX = "Timed out after "
 NO_PYTHON_FILES = "No Python files changed."
+# Prefix emitted by ``quality_gates._run_command`` when the subprocess could
+# not be started at all (OSError from ``subprocess.run``: missing shell,
+# vanished cwd, ...). Distinct from a non-zero exit with captured output,
+# which means the tool ran and reported a real failure. The gate runner maps
+# this prefix to ``inconclusive`` (reason ``evidence-missing``) — see
+# ``_command_failure_result``.
+COMMAND_ERROR_PREFIX = "Command error: "
 
 if TYPE_CHECKING:
     from bernstein.core.quality.quality_gates import QualityGatesConfig
