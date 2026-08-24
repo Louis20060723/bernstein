@@ -717,6 +717,31 @@ class PluginInstallResult:
     skipped: list[SkippedSkill]
 
 
+def _resolve_plugin_skills_dir(source: Path, data: dict[str, object]) -> Path | None:
+    """Resolve the ``skills`` field of a plugin manifest, containment-checked.
+
+    ``plugin.json`` is untrusted input: it arrives with whatever tree the
+    user was handed. An absolute value, a ``../`` component, or an
+    ordinary-looking component that is a symlink out of the tree would
+    otherwise make ``skills_dir.iterdir()`` walk a directory outside the
+    plugin root, and every ``SKILL.md`` found there would be copied into
+    the install scope. ``contained_subpath`` pairs a string-shape check
+    (rejects absolute and ``..`` shapes before any filesystem call) with a
+    realpath comparison (catches the symlink case), so a manifest that
+    escapes the root is treated as not-a-plugin.
+
+    Returns ``None`` on any refusal so layout detection and install share
+    one resolution path and cannot drift apart.
+    """
+    skills_field = data.get("skills")
+    if not isinstance(skills_field, str) or not skills_field:
+        return None
+    try:
+        return contained_subpath(source, skills_field, label="plugin skills directory")
+    except (PathContainmentError, OSError):
+        return None
+
+
 def is_agent_plugins_layout(source: Path) -> bool:
     """Strict Agent Plugins v1.0.0 layout detection.
 
@@ -724,7 +749,8 @@ def is_agent_plugins_layout(source: Path) -> bool:
     ``plugin.json`` parses with a non-empty ``name`` field and a ``skills``
     field that resolves to a ``skills/`` subdirectory. Strict by design
     (#3772 decision): avoids misfiring on unrelated directories that merely
-    happen to contain a ``skills/`` folder.
+    happen to contain a ``skills/`` folder. The ``skills`` field must stay
+    inside the plugin root (see :func:`_resolve_plugin_skills_dir`).
     """
     if not source.is_dir():
         return False
@@ -741,10 +767,8 @@ def is_agent_plugins_layout(source: Path) -> bool:
     name = data.get("name")
     if not isinstance(name, str) or not name:
         return False
-    skills_field = data.get("skills")
-    if not isinstance(skills_field, str) or not skills_field:
-        return False
-    return (source / skills_field).is_dir()
+    skills_dir = _resolve_plugin_skills_dir(source, data)
+    return skills_dir is not None and skills_dir.is_dir()
 
 
 def install_plugin_local(
@@ -765,14 +789,40 @@ def install_plugin_local(
     invalid individual skill is skipped with a diagnostic naming it rather
     than aborting the whole plugin install.
     """
-    if not is_agent_plugins_layout(source):
+    if not source.is_dir():
         raise SkillLifecycleError(
             f"{source}: not an Agent Plugins directory layout "
             f"(root {PLUGIN_MANIFEST_FILENAME} with name + skills/ required)"
         )
-    manifest_raw = json.loads((source / PLUGIN_MANIFEST_FILENAME).read_text(encoding="utf-8"))
-    manifest: dict[str, Any] = manifest_raw
-    skills_dir = source / str(manifest["skills"])
+    manifest_path = source / PLUGIN_MANIFEST_FILENAME
+    try:
+        manifest_raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SkillLifecycleError(
+            f"{source}: not an Agent Plugins directory layout "
+            f"(root {PLUGIN_MANIFEST_FILENAME} with name + skills/ required)"
+        ) from exc
+    if not isinstance(manifest_raw, dict):
+        raise SkillLifecycleError(
+            f"{source}: not an Agent Plugins directory layout "
+            f"(root {PLUGIN_MANIFEST_FILENAME} with name + skills/ required)"
+        )
+    manifest = cast("dict[str, object]", manifest_raw)
+    name_field = manifest.get("name")
+    if not isinstance(name_field, str) or not name_field:
+        raise SkillLifecycleError(
+            f"{source}: not an Agent Plugins directory layout "
+            f"(root {PLUGIN_MANIFEST_FILENAME} with name + skills/ required)"
+        )
+    # Resolved once, containment-checked: the same value is used for the
+    # walk below and for the lockfile paths, never re-joined from the raw
+    # manifest string.
+    skills_dir = _resolve_plugin_skills_dir(source, manifest)
+    if skills_dir is None or not skills_dir.is_dir():
+        raise SkillLifecycleError(
+            f"{source}: plugin manifest 'skills' must resolve to a directory "
+            "inside the plugin root"
+        )
 
     installed: list[InstallResult] = []
     skipped: list[SkippedSkill] = []
@@ -800,24 +850,29 @@ def install_plugin_local(
             skipped.append(SkippedSkill(name=name, reason=str(exc)))
 
     if installed:
-        _record_plugin_lock(installed, source, workdir=workdir)
+        _record_plugin_lock(installed, skills_dir, workdir=workdir)
     return PluginInstallResult(installed=installed, skipped=skipped)
 
 
 def _record_plugin_lock(
     installed: list[InstallResult],
-    source: Path,
+    skills_dir: Path,
     *,
     workdir: Path,
 ) -> None:
-    """Merge plugin-installed skills into ``skills.lock`` ([[skills]] rows)."""
+    """Merge plugin-installed skills into ``skills.lock`` ([[skills]] rows).
+
+    Each row's ``path`` names the ``skills/<name>/`` directory the skill
+    came from (not the plugin root), so a later ``sync``/drift reader can
+    locate the individual skill tree.
+    """
     lock_path = workdir / SKILLS_LOCK_FILENAME
     entries = _read_lock(lock_path)
     for result in installed:
         entries[result.name] = LockEntry(
             name=result.name,
             source=_PLUGIN_LOCK_SOURCE,
-            path=str(source),
+            path=str(skills_dir / result.name),
             digest=result.digest.digest,
         )
     _write_lock(lock_path, list(entries.values()))

@@ -187,5 +187,69 @@ def test_install_plugin_writes_lockfile_entries(
     lock_path = workdir / "skills.lock"
     assert lock_path.is_file()
     content = lock_path.read_text(encoding="utf-8")
+    resolved_root = plugin_dir.resolve()
     for name in ("alpha", "beta", "gamma"):
         assert f"name = \"{name}\"" in content
+        # path names the skills/<name>/ directory the skill came from, not
+        # the plugin root, so sync/drift can locate the individual tree.
+        assert f"path = \"{resolved_root}/skills/{name}\"" in content
+
+
+# ---------------------------------------------------------------------------
+# Manifest containment (#4448 review): an untrusted plugin.json must not be
+# able to make detection or install walk outside the plugin root.
+# ---------------------------------------------------------------------------
+
+
+def test_layout_detection_rejects_manifest_with_escaping_skills(tmp_path: Path) -> None:
+    """A manifest whose skills field escapes the plugin root is NOT a plugin layout."""
+    root = tmp_path / "escaping"
+    (root / "skills" / "alpha").mkdir(parents=True)
+    _write_skill(root / "skills" / "alpha" / "SKILL.md", "alpha")
+    _write_manifest(root / "plugin.json", name="escaping", skills="../../outside")
+    assert is_agent_plugins_layout(root) is False
+
+
+def test_layout_detection_rejects_manifest_with_absolute_skills(tmp_path: Path) -> None:
+    """An absolute skills value short-circuits the join and is refused."""
+    root = tmp_path / "absolute"
+    (root / "skills" / "alpha").mkdir(parents=True)
+    _write_skill(root / "skills" / "alpha" / "SKILL.md", "alpha")
+    _write_manifest(root / "plugin.json", name="absolute", skills=str(tmp_path))
+    assert is_agent_plugins_layout(root) is False
+
+
+def test_layout_detection_rejects_symlinked_skills_escape(tmp_path: Path) -> None:
+    """A skills directory that is a symlink out of the tree is refused."""
+    root = tmp_path / "symlink-escape"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    (outside / "alpha").mkdir(parents=True)
+    _write_skill(outside / "alpha" / "SKILL.md", "alpha")
+    (root / "skills").symlink_to(outside, target_is_directory=True)
+    _write_manifest(root / "plugin.json", name="symlink-escape")
+    assert is_agent_plugins_layout(root) is False
+
+
+def test_install_plugin_raises_on_escaping_manifest(tmp_path: Path) -> None:
+    """install_plugin_local refuses an escaping skills field outright.
+
+    Nothing may be installed into scope from outside the plugin root, and
+    the failure is a hard error rather than a silent empty install.
+    """
+    root = tmp_path / "escaping"
+    (root / "skills" / "alpha").mkdir(parents=True)
+    _write_skill(root / "skills" / "alpha" / "SKILL.md", "alpha")
+    _write_manifest(root / "plugin.json", name="escaping", skills="../../outside")
+
+    workdir = tmp_path / "project"
+    with pytest.raises(SkillLifecycleError):
+        install_plugin_local(
+            root,
+            scope=InstallScope.PROJECT,
+            workdir=workdir,
+        )
+
+    # Nothing outside the root was walked or copied into scope.
+    dest = scope_root(InstallScope.PROJECT, workdir=workdir)
+    assert not dest.exists()

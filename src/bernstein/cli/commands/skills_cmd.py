@@ -318,6 +318,13 @@ def skills_install(source: Path, scope: str, override_name: str | None, strict: 
     try:
         resolved = source.resolve()
         if is_agent_plugins_layout(resolved):
+            if override_name is not None:
+                console.print(
+                    "[red]install failed:[/red] --name does not apply to a plugin "
+                    "directory (a pack installs every skill under skills/ under "
+                    "its own name)"
+                )
+                raise SystemExit(1)
             plugin_result = install_plugin_local(
                 resolved,
                 scope=install_scope,
