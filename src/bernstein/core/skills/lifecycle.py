@@ -38,6 +38,7 @@ Out of scope for this module (deferred to follow-up tracks):
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import tomllib
 from dataclasses import dataclass
@@ -53,7 +54,7 @@ from bernstein.core.security.path_containment import (
     contained_subpath,
 )
 from bernstein.core.skills.lint import LintSeverity, lint_skill
-from bernstein.core.skills.manifest import SkillManifest
+from bernstein.core.skills.manifest import SkillManifest, parse_skill_md
 from bernstein.core.skills.sanitizer import strip_invisible_tags
 
 # ---------------------------------------------------------------------------
@@ -687,6 +688,139 @@ def install_local(
         shutil.rmtree(install_dir)
     staging_dir.replace(install_dir)
     return InstallResult(name=name, install_dir=install_dir, digest=digest, changed=True)
+
+
+# ---------------------------------------------------------------------------
+# Agent Plugins directory layout (#3772, slice 1 of #3540)
+# ---------------------------------------------------------------------------
+
+#: Filename of the Agent Plugins v1.0.0 root manifest.
+PLUGIN_MANIFEST_FILENAME: str = "plugin.json"
+
+#: Lockfile ``source`` tag for skills installed from a plugin directory.
+_PLUGIN_LOCK_SOURCE: str = "plugin"
+
+
+@dataclass(frozen=True)
+class SkippedSkill:
+    """A skill inside a plugin tree that was not installed."""
+
+    name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PluginInstallResult:
+    """Outcome of installing every skill under an Agent Plugins directory."""
+
+    installed: list[InstallResult]
+    skipped: list[SkippedSkill]
+
+
+def is_agent_plugins_layout(source: Path) -> bool:
+    """Strict Agent Plugins v1.0.0 layout detection.
+
+    A directory counts as an Agent Plugins layout only when a root
+    ``plugin.json`` parses with a non-empty ``name`` field and a ``skills``
+    field that resolves to a ``skills/`` subdirectory. Strict by design
+    (#3772 decision): avoids misfiring on unrelated directories that merely
+    happen to contain a ``skills/`` folder.
+    """
+    if not source.is_dir():
+        return False
+    manifest_path = source / PLUGIN_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        return False
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    data = cast("dict[str, object]", raw)
+    name = data.get("name")
+    if not isinstance(name, str) or not name:
+        return False
+    skills_field = data.get("skills")
+    if not isinstance(skills_field, str) or not skills_field:
+        return False
+    return (source / skills_field).is_dir()
+
+
+def install_plugin_local(
+    source: Path,
+    *,
+    scope: InstallScope,
+    workdir: Path,
+    home: Path | None = None,
+    strict_lint: bool = False,
+    accept_risk: bool = False,
+) -> PluginInstallResult:
+    """Install every skill under an Agent Plugins directory layout.
+
+    A non-plugin directory raises :class:`SkillLifecycleError`. Each
+    conformant ``skills/<name>/SKILL.md`` is installed through
+    :func:`install_local` and recorded in ``skills.lock`` with its content
+    digest (``source="plugin"``) so a later ``sync`` can detect drift. An
+    invalid individual skill is skipped with a diagnostic naming it rather
+    than aborting the whole plugin install.
+    """
+    if not is_agent_plugins_layout(source):
+        raise SkillLifecycleError(
+            f"{source}: not an Agent Plugins directory layout "
+            f"(root {PLUGIN_MANIFEST_FILENAME} with name + skills/ required)"
+        )
+    manifest_raw = json.loads((source / PLUGIN_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    manifest: dict[str, Any] = manifest_raw
+    skills_dir = source / str(manifest["skills"])
+
+    installed: list[InstallResult] = []
+    skipped: list[SkippedSkill] = []
+    for skill_dir in sorted(skills_dir.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        name = skill_dir.name
+        # Per-skill isolation: one bad SKILL.md must not abort the pack.
+        try:
+            parse_skill_md(skill_md)
+            installed.append(
+                install_local(
+                    skill_dir,
+                    scope=scope,
+                    workdir=workdir,
+                    home=home,
+                    strict_lint=strict_lint,
+                    accept_risk=accept_risk,
+                )
+            )
+        except Exception as exc:  # per-skill skip contract: one bad SKILL.md must not abort the pack
+            skipped.append(SkippedSkill(name=name, reason=str(exc)))
+
+    if installed:
+        _record_plugin_lock(installed, source, workdir=workdir)
+    return PluginInstallResult(installed=installed, skipped=skipped)
+
+
+def _record_plugin_lock(
+    installed: list[InstallResult],
+    source: Path,
+    *,
+    workdir: Path,
+) -> None:
+    """Merge plugin-installed skills into ``skills.lock`` ([[skills]] rows)."""
+    lock_path = workdir / SKILLS_LOCK_FILENAME
+    entries = _read_lock(lock_path)
+    for result in installed:
+        entries[result.name] = LockEntry(
+            name=result.name,
+            source=_PLUGIN_LOCK_SOURCE,
+            path=str(source),
+            digest=result.digest.digest,
+        )
+    _write_lock(lock_path, list(entries.values()))
 
 
 def _copy_skill_tree(source: Path, dest: Path) -> None:
