@@ -820,8 +820,7 @@ def install_plugin_local(
     skills_dir = _resolve_plugin_skills_dir(source, manifest)
     if skills_dir is None or not skills_dir.is_dir():
         raise SkillLifecycleError(
-            f"{source}: plugin manifest 'skills' must resolve to a directory "
-            "inside the plugin root"
+            f"{source}: plugin manifest 'skills' must resolve to a directory inside the plugin root"
         )
 
     installed: list[InstallResult] = []
