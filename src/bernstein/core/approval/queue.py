@@ -110,11 +110,29 @@ class ApprovalQueue:
     UI and the ``bernstein approve`` CLI) observe the same queue.
     """
 
-    def __init__(self, base_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        base_dir: Path | None = None,
+        *,
+        audit_dir: Path | None = None,
+        workdir: Path | None = None,
+    ) -> None:
         """Create a queue rooted at *base_dir* (defaults to cwd)."""
         if base_dir is None:
             base_dir = Path.cwd() / _RUNTIME_DIR
         self._base_dir = base_dir
+        if audit_dir is not None:
+            self._audit_dir = audit_dir
+        elif workdir is not None:
+            self._audit_dir = workdir / ".sdd" / "audit"
+        else:
+            sdd = None
+            curr = base_dir.resolve()
+            for parent in [curr, *curr.parents]:
+                if parent.name == ".sdd":
+                    sdd = parent
+                    break
+            self._audit_dir = (sdd / "audit") if sdd else (base_dir / "audit")
         self._lock = threading.RLock()
         self._pending: dict[str, PendingApproval] = {}
         self._resolved: dict[str, ResolvedApproval] = {}
@@ -130,6 +148,11 @@ class ApprovalQueue:
     def base_dir(self) -> Path:
         """Return the on-disk directory that backs this queue."""
         return self._base_dir
+
+    @property
+    def audit_dir(self) -> Path:
+        """Return the audit log directory for chain-recorded resolutions."""
+        return self._audit_dir
 
     def _member_path(self, approval_id: str, suffix: str) -> Path:
         """Return the queue-member path for *approval_id*, containment-checked.
@@ -250,6 +273,8 @@ class ApprovalQueue:
         *,
         reason: str = "",
         nonce: bytes | str | None = None,
+        source: str = "human",
+        channel: str | None = None,
     ) -> ResolvedApproval:
         """Record an operator decision for *approval_id*.
 
@@ -268,6 +293,8 @@ class ApprovalQueue:
                 Mismatches raise :class:`ApprovalNonceMismatch`; replays
                 or stale nonces against an already-resolved or expired
                 approval raise :class:`ApprovalNonceExpired`.
+            source: Resolving channel or identity attribution (e.g.
+                ``cli``, ``http``, ``tui``, or ``human``).
 
         Returns:
             The authoritative :class:`ResolvedApproval`.
@@ -319,6 +346,16 @@ class ApprovalQueue:
             self._pending_path(approval_id).unlink(missing_ok=True)
         except OSError as exc:
             logger.debug("Could not remove pending file for %s: %s", sanitize_log(approval_id), exc)
+
+        # Record human resolution and any always-allow promotion to the tamper-evident audit chain.
+        _record_human_approval_decision(
+            self._audit_dir,
+            approval=pending,
+            decision=decision,
+            reason=reason,
+            source=source,
+            channel=channel,
+        )
 
         # Signal any awaiting wait_for(). Event.set() is thread-safe but
         # must be scheduled on the loop that created the Event.
@@ -542,3 +579,73 @@ def promote_to_always_allow(
     except (OSError, ValueError) as exc:
         logger.warning("Wrote rule but could not refresh always-allow manifest: %s", exc)
     return target
+
+
+def _record_human_approval_decision(
+    audit_dir: Path,
+    *,
+    approval: PendingApproval,
+    decision: ApprovalDecision,
+    reason: str = "",
+    source: str = "human",
+    channel: str | None = None,
+) -> None:
+    """Record a human/operator approval resolution and any promotion to the audit chain.
+
+    Persistence is best-effort, matching ``auto_approve_decision`` in
+    ``gate.py``: a write failure is logged and the resolution still stands,
+    because refusing to resolve an approval because its audit line could not
+    be appended would wedge the queue on a filesystem fault.
+
+    The payload mirrors that sibling event and records the extracted
+    ``command`` rather than the whole ``tool_args`` mapping. Two events in one
+    chain that disagree on how much of a call they retain is a difference an
+    auditor has to explain, and the mapping can carry argument values that
+    have no reason to live in a replayable log.
+    """
+    from bernstein.core.security.audit import AuditLog
+
+    cmd = str(approval.tool_args.get("command") or approval.tool_args.get("shell_cmd") or "")
+    details: dict[str, Any] = {
+        "approval_id": approval.id,
+        "decision": decision.value,
+        "tool": approval.tool_name,
+        "reason": reason,
+        "decision_source": source,
+        # An unnamed surface is recorded as unknown rather than defaulted to a
+        # plausible one: an audit entry that guesses where a decision came from
+        # is worse than one that says it does not know.
+        "channel": channel or "unspecified",
+        "session_id": approval.session_id,
+        "agent_role": approval.agent_role,
+    }
+    if cmd:
+        details["command"] = cmd
+    try:
+        log = AuditLog(audit_dir=audit_dir)
+        log.log(
+            event_type="human_approval_decision",
+            actor=source or "human",
+            resource_type="tool_call",
+            resource_id=approval.tool_name,
+            details=details,
+        )
+        if decision is ApprovalDecision.ALWAYS:
+            log.log(
+                event_type="always_allow_promotion",
+                actor=source or "human",
+                resource_type="always_allow_rule",
+                resource_id=approval.tool_name,
+                details={
+                    "approval_id": approval.id,
+                    "tool": approval.tool_name,
+                    "session_id": approval.session_id,
+                    "agent_role": approval.agent_role,
+                    "promoted_by": source,
+                },
+            )
+    except Exception as exc:  # pragma: no cover - filesystem/permission error
+        logger.warning(
+            "Could not record human approval decision to audit log: %s",
+            exc,
+        )

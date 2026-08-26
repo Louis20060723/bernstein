@@ -160,7 +160,7 @@ after workflow changes merge and opens a squash auto-merge PR when the committed
 | .github/workflows/bernstein-issues-decompose.yml | workflow: {"contents": "read"}<br>decompose: {"contents": "write", "issues": "write", "pull-requests": "write"}<br>plan: {"contents": "read"}<br>reject-untrusted-issue: {"issues": "write"}<br>scope_gate: {"issues": "write"} | ANTHROPIC_API_KEY, BERNSTEIN_AUTOSYNC_TOKEN, GOOGLE_API_KEY, OPENAI_API_KEY |
 | .github/workflows/bernstein-pr-review.yml | workflow: {"contents": "read"}<br>review: {"contents": "read", "pull-requests": "write"} | ANTHROPIC_API_KEY |
 | .github/workflows/bisect-on-red.yml | bisect: {"contents": "read", "issues": "write", "pull-requests": "write"} | - |
-| .github/workflows/branch-protection-audit.yml | audit: {"contents": "read"} | BRANCH_PROTECTION_AUDIT_TOKEN |
+| .github/workflows/branch-protection-audit.yml | audit: {"contents": "read", "issues": "write"} | BRANCH_PROTECTION_AUDIT_TOKEN |
 | .github/workflows/ci-gate-stub.yml | workflow: {"contents": "read"}<br>ci-gate: {"contents": "read"}<br>classify: {"contents": "read", "pull-requests": "read"} | - |
 | .github/workflows/ci-macos-nightly.yml | workflow: {"contents": "read"}<br>open-failure-issue: {"contents": "read", "issues": "write"}<br>test-macos-nightly: {"contents": "read"} | GITHUB_TOKEN |
 | .github/workflows/ci-topology-heal.yml | workflow: {"contents": "read"}<br>heal: {"contents": "write", "pull-requests": "write"} | BERNSTEIN_AUTOSYNC_TOKEN, GITHUB_TOKEN |

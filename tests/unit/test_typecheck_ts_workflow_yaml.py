@@ -255,3 +255,37 @@ def test_install_command_matches_lockfile_presence(
                 f"`{package}` has no package-lock.json, so `npm ci` aborts before `tsc` ever runs. Use "
                 "`npm install` for this cell, or commit a lockfile."
             )
+
+
+def test_typecheck_ts_cannot_be_required_while_pull_request_trigger_is_path_filtered(
+    doc: dict[str, Any],
+    matrix_entries: list[dict[str, Any]],
+) -> None:
+    """Requiring typecheck-ts contexts before widening pull_request trigger wedges non-TS PRs (#4557).
+
+    A required status check only reports for the events its trigger accepts. With a `paths`
+    filter in place, requiring the context means every PR outside the filter waits on a workflow
+    run that never starts, permanently wedging the PR.
+    """
+    pr_trigger = _on(doc).get("pull_request")
+    has_path_filter = isinstance(pr_trigger, dict) and bool(pr_trigger.get("paths") or pr_trigger.get("paths-ignore"))
+
+    if has_path_filter:
+        published = {f"typecheck ({entry.get('package')})" for entry in matrix_entries if entry.get("package")}
+        ruleset_path = REPO / "docs/operations/merge-queue-ruleset.json"
+        if ruleset_path.exists():
+            ruleset_data = json.loads(ruleset_path.read_text(encoding="utf-8"))
+            required_contexts: set[str] = set()
+            for rule in ruleset_data.get("rules", []):
+                if rule.get("type") == "required_status_checks":
+                    for c in rule.get("parameters", {}).get("required_status_checks", []):
+                        if isinstance(c, dict) and "context" in c:
+                            required_contexts.add(c["context"])
+
+            disallowed = published & required_contexts
+            assert not disallowed, (
+                f"typecheck-ts contexts {disallowed} are required in merge-queue-ruleset.json while "
+                f"typecheck-ts.yml's pull_request trigger still carries a `paths` filter. "
+                "Every non-TypeScript PR will be permanently wedged waiting for a run that never starts. "
+                "Widen the pull_request trigger or add an all-paths fallback stub before requiring."
+            )

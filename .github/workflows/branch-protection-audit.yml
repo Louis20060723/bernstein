@@ -49,30 +49,24 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-    env:
-      # Admin-scoped read is required to fetch repository rulesets; the
-      # default github.token cannot do it. See the workflow header for the
-      # secret's required fine-grained PAT scopes. No github.token fallback.
-      GH_TOKEN: ${{ secrets.BRANCH_PROTECTION_AUDIT_TOKEN }}
+      issues: write
     steps:
       - name: Harden runner (audit mode)
         uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
-      - name: Require branch-protection audit token
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::BRANCH_PROTECTION_AUDIT_TOKEN secret not configured. Create a fine-grained PAT (Administration: read-only, Contents: read) for this repo and store it as the BRANCH_PROTECTION_AUDIT_TOKEN secret. See the workflow header comment."
-            exit 1
-          fi
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Audit live branch ruleset for main
+        id: run_audit
+        env:
+          # Admin-scoped read is required to fetch repository rulesets; the
+          # default github.token cannot do it. See the workflow header for the
+          # secret's required fine-grained PAT scopes. No github.token fallback.
+          GH_TOKEN: ${{ secrets.BRANCH_PROTECTION_AUDIT_TOKEN }}
         # scripts/check_branch_ruleset_audit.py reads rules/branches/main,
         # rulesets, and rulesets/{id} (stdlib-only, no `uv sync` needed for
         # this job) and asserts: merge_queue, non_fast_forward and deletion
@@ -80,4 +74,24 @@ jobs:
         # required-check canary; every referenced ruleset is 'active'; no
         # bypass actor. See the workflow header for why the classic
         # protection endpoint is not read here.
-        run: python3 scripts/check_branch_ruleset_audit.py
+        run: |
+          set +e
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::BRANCH_PROTECTION_AUDIT_TOKEN secret not configured. Create a fine-grained PAT (Administration: read-only, Contents: read) for this repo and store it as the BRANCH_PROTECTION_AUDIT_TOKEN secret. See the workflow header comment."
+            echo '{"exit_code": 2, "detail": "BRANCH_PROTECTION_AUDIT_TOKEN secret not configured"}' > .audit_result.json
+            exit 2
+          fi
+          python3 scripts/check_branch_ruleset_audit.py
+          CODE=$?
+          echo "{\"exit_code\": ${CODE}, \"detail\": \"check_branch_ruleset_audit exit code ${CODE}\"}" > .audit_result.json
+          exit ${CODE}
+
+      - name: Toggle branch protection audit marker issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/toggle_branch_protection_audit_marker.py \
+            --repo "${REPO}" \
+            --result-file .audit_result.json

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import tomllib
 from dataclasses import dataclass
@@ -779,6 +780,7 @@ def install_plugin_local(
     home: Path | None = None,
     strict_lint: bool = False,
     accept_risk: bool = False,
+    force: bool = False,
 ) -> PluginInstallResult:
     """Install every skill under an Agent Plugins directory layout.
 
@@ -788,6 +790,14 @@ def install_plugin_local(
     digest (``source="plugin"``) so a later ``sync`` can detect drift. An
     invalid individual skill is skipped with a diagnostic naming it rather
     than aborting the whole plugin install.
+
+    A skill whose name already holds a lock row from a *different* source -
+    ``bernstein-skills.toml`` - is refused the same way,
+    naming the source it would have replaced. Overwriting it would delete an
+    install the operator chose deliberately and silently flip that row's
+    provenance to ``"plugin"``, letting a pack shadow a trusted skill. Pass
+    ``force=True`` to take the replacement anyway. A same-source reinstall
+    (drift heal, upgrade) is untouched and stays silent.
     """
     if not source.is_dir():
         raise SkillLifecycleError(
@@ -820,12 +830,16 @@ def install_plugin_local(
     skills_dir = _resolve_plugin_skills_dir(source, manifest)
     if skills_dir is None or not skills_dir.is_dir():
         raise SkillLifecycleError(
-            f"{source}: plugin manifest 'skills' must resolve to a directory "
-            "inside the plugin root"
+            f"{source}: plugin manifest 'skills' must resolve to a directory inside the plugin root"
         )
 
     installed: list[InstallResult] = []
     skipped: list[SkippedSkill] = []
+    # Read before the loop: the collision has to be caught *before*
+    # install_local writes, because that call already clobbers the target
+    # directory. Refusing only at lock-write time would leave the previous
+    # skill's tree destroyed with no row describing it.
+    existing_lock = {} if force else _read_lock(workdir / SKILLS_LOCK_FILENAME)
     for skill_dir in sorted(skills_dir.iterdir()):
         if not skill_dir.is_dir():
             continue
@@ -835,6 +849,17 @@ def install_plugin_local(
         name = skill_dir.name
         # Per-skill isolation: one bad SKILL.md must not abort the pack.
         try:
+            # The field-level check proved skills_dir is inside the plugin;
+            # this proves the entry is too. A skill directory symlinked out
+            # of the pack would install content the operator never saw.
+            if _escapes(skills_dir, skill_dir):
+                raise SkillLifecycleError(f"{skill_dir}: skill directory resolves outside the plugin")
+            prior = existing_lock.get(name)
+            if prior is not None and prior.source != _PLUGIN_LOCK_SOURCE:
+                raise SkillLifecycleError(
+                    f"{name}: already installed from source {prior.source!r}; "
+                    f"installing this plugin would replace it. Re-run with --force to take the plugin's copy"
+                )
             parse_skill_md(skill_md)
             installed.append(
                 install_local(
@@ -878,6 +903,18 @@ def _record_plugin_lock(
     _write_lock(lock_path, list(entries.values()))
 
 
+def _escapes(root: Path, candidate: Path) -> bool:
+    """Whether *candidate* resolves outside *root* once symlinks are followed.
+
+    The string-shape half of the containment barrier does not apply here:
+    these paths come from ``iterdir``/``rglob`` over a tree we were handed,
+    so the only lie available is a symlink, and ``realpath`` is the check
+    that sees through it.
+    """
+    prefix = os.path.join(os.path.realpath(root), "")
+    return not os.path.realpath(candidate).startswith(prefix)
+
+
 def _copy_skill_tree(source: Path, dest: Path) -> None:
     """Copy a skill directory tree, preserving SKILL.md + sibling buckets.
 
@@ -885,8 +922,15 @@ def _copy_skill_tree(source: Path, dest: Path) -> None:
     ``scripts``, ``assets``) are mirrored; anything else under the source
     directory is ignored so a dotfile from the author's editor cannot leak
     into the installed copy.
+
+    Every copied path must resolve inside *source*: the tree is untrusted
+    input, and a symlinked bucket or nested file would otherwise publish
+    content from outside the tree the operator inspected -- the same escape
+    :func:`_resolve_plugin_skills_dir` refuses one level up.
     """
     skill_md = source / "SKILL.md"
+    if _escapes(source, skill_md):
+        raise SkillLifecycleError(f"{skill_md}: SKILL.md resolves outside the skill directory")
     shutil.copy2(skill_md, dest / "SKILL.md")
     for bucket in ("references", "scripts", "assets"):
         src_bucket = source / bucket
@@ -901,6 +945,8 @@ def _copy_skill_tree(source: Path, dest: Path) -> None:
         for child in sorted(src_bucket.rglob("*")):
             if not child.is_file():
                 continue
+            if _escapes(source, child):
+                raise SkillLifecycleError(f"{child}: {bucket} entry resolves outside the skill directory")
             rel = child.relative_to(src_bucket)
             target = dst_bucket / rel
             target.parent.mkdir(parents=True, exist_ok=True)

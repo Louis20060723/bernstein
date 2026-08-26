@@ -67,3 +67,20 @@ class TestTypeContract:
 
     def test_valid_link_passes(self) -> None:
         assert isinstance(_call(artifact_type="link", url="https://x", link_kind="preview"), ValidatedPayload)
+
+    def test_finding_requires_sarif_result(self) -> None:
+        assert isinstance(_call(artifact_type="finding"), ValidationError)
+
+    def test_valid_finding_passes(self) -> None:
+        sarif = {
+            "ruleId": "TEST-001",
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": "src/a.py"},
+                        "region": {"startLine": 1, "snippet": {"text": "x"}},
+                    }
+                }
+            ],
+        }
+        assert isinstance(_call(artifact_type="finding", sarif_result=sarif, tool="semgrep"), ValidatedPayload)

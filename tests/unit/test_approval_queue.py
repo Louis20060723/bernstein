@@ -202,3 +202,116 @@ def test_resolve_unknown_id_raises(tmp_path: Path) -> None:
     queue = ApprovalQueue(base_dir=tmp_path)
     with pytest.raises(KeyError):
         queue.resolve("ap-doesnotexist", ApprovalDecision.ALLOW)
+
+
+def test_human_allow_appends_audit_chain_event(tmp_path: Path) -> None:
+    from bernstein.core.security.audit import AuditLog
+
+    sdd = tmp_path / ".sdd"
+    queue = ApprovalQueue(base_dir=sdd / "runtime" / "approvals")
+    approval = _push(queue, tool="shell", session="S-100")
+
+    resolution = queue.resolve(approval.id, ApprovalDecision.ALLOW, reason="looks safe", source="cli")
+    assert resolution.decision is ApprovalDecision.ALLOW
+
+    audit = AuditLog(audit_dir=sdd / "audit")
+    events = audit.query(event_type="human_approval_decision")
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type == "human_approval_decision"
+    assert event.actor == "cli"
+    assert event.resource_id == "shell"
+    assert event.details["approval_id"] == approval.id
+    assert event.details["decision"] == "allow"
+    assert event.details["reason"] == "looks safe"
+    assert event.details["decision_source"] == "cli"
+
+    # Verify audit chain integrity
+    assert audit.verify()
+
+
+def test_human_and_classifier_decisions_are_distinguishable_in_chain(tmp_path: Path) -> None:
+    from bernstein.core.approval.gate import _record_classifier_decision
+    from bernstein.core.security.audit import AuditLog
+    from bernstein.core.security.auto_approve import ApprovalResult as ClassifierResult
+    from bernstein.core.security.auto_approve import Decision
+
+    sdd = tmp_path / ".sdd"
+    queue = ApprovalQueue(base_dir=sdd / "runtime" / "approvals")
+
+    # Record automated classifier decision
+    clf_result = ClassifierResult(Decision.APPROVE, reason="matches rule", matched_pattern="git status")
+    _record_classifier_decision(
+        classification=clf_result,
+        session_id="S-1",
+        agent_role="backend",
+        tool_name="shell",
+        tool_args={"command": "git status"},
+        workdir=tmp_path,
+    )
+
+    # Record human decision
+    approval = _push(queue, tool="shell", session="S-1")
+    queue.resolve(approval.id, ApprovalDecision.ALLOW, reason="manual override", source="human")
+
+    audit = AuditLog(audit_dir=sdd / "audit")
+    all_events = audit.query()
+    event_types = [e.event_type for e in all_events]
+
+    assert "auto_approve_decision" in event_types
+    assert "human_approval_decision" in event_types
+
+    auto_event = next(e for e in all_events if e.event_type == "auto_approve_decision")
+    human_event = next(e for e in all_events if e.event_type == "human_approval_decision")
+
+    assert auto_event.event_type != human_event.event_type
+    assert auto_event.details["matched_pattern"] == "git status"
+    assert human_event.details["approval_id"] == approval.id
+    assert human_event.details["decision_source"] == "human"
+
+
+def test_always_allow_promotion_is_recorded_as_its_own_event(tmp_path: Path) -> None:
+    from bernstein.core.security.audit import AuditLog
+
+    sdd = tmp_path / ".sdd"
+    queue = ApprovalQueue(base_dir=sdd / "runtime" / "approvals")
+    approval = _push(queue, tool="write_file", session="S-2")
+
+    queue.resolve(approval.id, ApprovalDecision.ALWAYS, reason="trust this tool", source="tui")
+
+    audit = AuditLog(audit_dir=sdd / "audit")
+    events = audit.query()
+    event_types = [e.event_type for e in events]
+
+    assert "human_approval_decision" in event_types
+    assert "always_allow_promotion" in event_types
+
+    promo_event = next(e for e in events if e.event_type == "always_allow_promotion")
+    assert promo_event.actor == "tui"
+    assert promo_event.resource_type == "always_allow_rule"
+    assert promo_event.resource_id == "write_file"
+    assert promo_event.details["approval_id"] == approval.id
+    assert promo_event.details["promoted_by"] == "tui"
+
+
+def test_chain_write_failure_does_not_leave_queue_inconsistent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from bernstein.core.security.audit import AuditLog
+
+    sdd = tmp_path / ".sdd"
+    queue = ApprovalQueue(base_dir=sdd / "runtime" / "approvals")
+    approval = _push(queue, tool="shell", session="S-3")
+
+    def _failing_log(*args: object, **kwargs: object) -> dict[str, object]:
+        raise OSError("Simulated disk error while writing audit chain")
+
+    monkeypatch.setattr(AuditLog, "log", _failing_log)
+
+    # Resolution must not raise even if audit chain write fails
+    resolution = queue.resolve(approval.id, ApprovalDecision.REJECT, reason="denied", source="cli")
+    assert resolution.decision is ApprovalDecision.REJECT
+
+    # Queue in-memory state and disk state must be fully consistent
+    assert queue.get_resolution(approval.id) is not None
+    assert queue.get(approval.id) is None
+    assert not (sdd / "runtime" / "approvals" / f"{approval.id}.json").exists()
+    assert (sdd / "runtime" / "approvals" / f"{approval.id}.resolved.json").exists()

@@ -103,6 +103,7 @@ from bernstein.core.agents.spawner_worktree import (
 from bernstein.core.context import TaskContextBuilder
 from bernstein.core.context_recommendations import RecommendationEngine
 from bernstein.core.defaults import SPAWN
+from bernstein.core.evidence.run_artifacts import record_persistent_agent_step
 from bernstein.core.lessons import gather_lessons_for_context
 from bernstein.core.lifecycle import transition_agent
 from bernstein.core.models import (
@@ -1008,9 +1009,9 @@ def _load_persistent_memory(
 
 
 def _build_rag_context(tasks: list[Task], workdir: Path, spawner_config: Any | None) -> str:
-    """Build RAG-based smart context injection."""
+    """Build RAG-based smart context injection using snippet ranges."""
     try:
-        from bernstein.core.rag import CodebaseIndexer
+        from bernstein.core.knowledge.rag import CodebaseIndexer
         from bernstein.core.section_dedup import deduplicate_section
 
         indexer = CodebaseIndexer(workdir)
@@ -1019,25 +1020,34 @@ def _build_rag_context(tasks: list[Task], workdir: Path, spawner_config: Any | N
         query = " ".join(t.title for t in tasks)
         rag_cfg = getattr(spawner_config, "rag", None)
         max_files = rag_cfg.max_files if rag_cfg else 5
-        max_chars = (rag_cfg.max_tokens if rag_cfg else 50000) * 4
+        max_tokens = rag_cfg.max_tokens if rag_cfg else 50000
 
         results = indexer.search(query, limit=max_files)
         if not results:
             return ""
-        lines = ["## Relevant Code Context\nAutomatically identified relevant files via RAG:"]
-        total_chars = 0
+
+        lines = ["## Relevant Code Snippets (RAG)"]
+        total_tokens = 0
+
         for res in results:
-            if total_chars >= max_chars:
+            # Estimate tokens for this entry
+            entry = (
+                f"### {res.file_path} (lines {res.line_start}-{res.line_end})\n"
+                f"Symbols: {', '.join(res.symbols) if res.symbols else '(none)'}\n"
+                f"```\n{res.snippet}\n```\n"
+            )
+            entry_tokens = len(entry) // 4  # Rough estimation
+
+            if total_tokens + entry_tokens > max_tokens:
+                logger.info("Truncating RAG context: reached budget of %d tokens", max_tokens)
                 break
-            path = Path(res["path"])
-            if not path.exists():
-                continue
-            content = path.read_text(encoding="utf-8", errors="replace")
-            remaining = max_chars - total_chars
-            if len(content) > remaining:
-                content = content[:remaining] + "\n... (truncated)"
-            lines.append(f"### {res['path']} (score: {res['score']:.2f})\n```\n{content}\n```")
-            total_chars += len(content)
+
+            lines.append(entry)
+            total_tokens += entry_tokens
+
+        if len(lines) <= 1:  # Only header, no content
+            return ""
+
         return deduplicate_section("\n".join(lines) + "\n")
     except Exception as rag_exc:
         logger.debug("Smart context injection failed: %s", rag_exc)
@@ -1240,6 +1250,14 @@ def _render_prompt_with_receipt(
     if specialist_block:
         named_sections.append(("specialists", specialist_block))
     named_sections.append(("tasks", f"\n## Assigned tasks\n{task_block}"))
+    # Artifact contract (#4539): surface the kind/path/criteria an
+    # artifact-mode task is judged by. Empty for the git path, so a plain
+    # coding task's prompt is unchanged.
+    from bernstein.core.agents.spawn_prompt import render_artifact_contract
+
+    artifact_contract = render_artifact_contract(tasks)
+    if artifact_contract:
+        named_sections.append(("artifact_contract", f"\n{artifact_contract}"))
     if lesson_context:
         named_sections.append(("lessons", f"\n{lesson_context}\n"))
     if persistent_memory_context:
@@ -1618,6 +1636,7 @@ class AgentSpawner:
         # dashboard can observe pending jobs and so merge-tree conflict checks
         # can be inserted on the queue's boundary ( fix).
         self._merge_queue: Any = None
+        self._quality_gate_config: Any = None
         self._traces: dict[str, AgentTrace] = {}
         self._trace_store = TraceStore(workdir / ".sdd" / "traces")
         self._runtime_bridge = runtime_bridge
@@ -1958,6 +1977,10 @@ class AgentSpawner:
         """
         self._merge_queue = merge_queue
 
+    def set_quality_gate_config(self, config: Any) -> None:
+        """Wire in the orchestrator's :class:`QualityGatesConfig` (#4393)."""
+        self._quality_gate_config = config
+
     def _merge_and_cleanup_worktree(
         self,
         session: AgentSession,
@@ -1978,6 +2001,7 @@ class AgentSpawner:
             workdir=self._workdir,
             merge_worktree_branch_fn=self._merge_worktree_branch,
             merge_queue=self._merge_queue,
+            quality_gate_config=self._quality_gate_config,
         )
 
     def _touch_prespawn_heartbeat(self, session_id: str) -> None:
@@ -2081,6 +2105,7 @@ class AgentSpawner:
             traces=self._traces,
             trace_store=self._trace_store,
             merge_queue=self._merge_queue,
+            quality_gate_config=self._quality_gate_config,
         )
         # Artifact-mode session (issue #2996): no worktree, so the merge path
         # above was a structural no-op; remove the plain workspace directory
@@ -4878,6 +4903,10 @@ class AgentSpawner:
             except Exception as exc:
                 logger.warning("Failed to write initial trace for %s: %s", session_id, exc)
 
+            # Record persistent-agent step for each task if adapter is persistent
+            for _t in tasks:
+                record_persistent_agent_step(self._workdir / ".sdd", _t.id, adapter_name)
+
             get_plugin_manager().fire_agent_spawned(
                 session_id=session.id, role=session.role, model=session.model_config.model
             )
@@ -5239,6 +5268,10 @@ class AgentSpawner:
 
         # Track worktree so reap_completed_agent can merge+clean up
         self._worktree_paths[session_id] = worktree_path
+
+        # Record persistent-agent step for each task if adapter is persistent
+        for _t in tasks:
+            record_persistent_agent_step(self._workdir / ".sdd", _t.id, self._adapter.name())
 
         return session
 

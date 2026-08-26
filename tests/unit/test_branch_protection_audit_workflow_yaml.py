@@ -25,7 +25,7 @@ class WorkflowFile(TypedDict, total=False):
 
 WORKFLOW = Path(".github/workflows/branch-protection-audit.yml")
 CANARY = Path(".github/workflows/required-check-canary.yml")
-REQUIRED_CONTEXTS = {"CI gate"}
+REQUIRED_CONTEXTS = {"CI gate", "shipped bundle matches the lockfile"}
 
 
 def _workflow_text() -> str:
@@ -97,10 +97,16 @@ def test_branch_protection_audit_is_scheduled_and_manual_only() -> None:
     assert schedule, "scheduled audit must include at least one cron entry"
 
 
-def test_branch_protection_audit_permissions_are_read_only() -> None:
+def test_branch_protection_audit_permissions() -> None:
     workflow = _workflow()
     assert workflow.get("permissions") in ({}, "{}"), "workflow-level permissions must be default-deny"
-    assert _audit_job(workflow).get("permissions") == {"contents": "read"}
+    assert _audit_job(workflow).get("permissions") == {"contents": "read", "issues": "write"}
+
+
+def test_branch_protection_audit_toggles_marker_issue_on_failure_and_recovery() -> None:
+    workflow_text = _workflow_text()
+    assert "scripts/toggle_branch_protection_audit_marker.py" in workflow_text
+    assert Path("scripts/toggle_branch_protection_audit_marker.py").exists()
 
 
 def test_branch_protection_audit_does_not_read_the_legacy_protection_endpoint() -> None:

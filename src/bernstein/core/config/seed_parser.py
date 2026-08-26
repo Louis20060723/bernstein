@@ -21,6 +21,10 @@ import yaml
 
 from bernstein.agents.catalog import CatalogRegistry
 from bernstein.core.compliance import ComplianceConfig, CompliancePreset
+from bernstein.core.config.run_overlay import (
+    RunOverlayError,
+    resolve_effective_mapping,
+)
 from bernstein.core.config.seed_config import (
     CORSConfig,
     DashboardAuthConfig,
@@ -29,6 +33,7 @@ from bernstein.core.config.seed_config import (
     ModelFallbackSeedConfig,
     NetworkConfig,
     NotifyConfig,
+    OrchestrationConfig,
     RateLimitBucketConfig,
     RateLimitConfig,
     SeedConfig,
@@ -1283,9 +1288,7 @@ def _parse_storage(raw: object) -> StorageConfig | None:
     _valid_storage_backends = ("memory", "postgres", "redis")
     if storage_backend_raw not in _valid_storage_backends:
         raise SeedError(f"storage.backend must be one of {list(_valid_storage_backends)}, got: {storage_backend_raw!r}")
-    storage_backend = cast(
-        'Literal["memory", "postgres", "redis"]', storage_backend_raw
-    )  # narrowed by membership check
+    storage_backend = cast(Literal["memory", "postgres", "redis"], storage_backend_raw)
     storage_db_url_raw: object = storage_dict.get("database_url")
     storage_db_url: str | None = str(storage_db_url_raw) if storage_db_url_raw is not None else None
     storage_redis_url_raw: object = storage_dict.get("redis_url")
@@ -1438,6 +1441,25 @@ def _parse_github(raw: object) -> GithubConfig:
     if not isinstance(sync_raw, bool):
         raise SeedError(f"github.sync_backlog must be a bool, got: {type(sync_raw).__name__}")
     return GithubConfig(sync_backlog=sync_raw)
+
+
+def _parse_orchestration(raw: object) -> OrchestrationConfig:
+    """Parse the optional ``orchestration`` section.
+
+    Only ``test_followup`` is recognised today (issue #4462): whether a run
+    that finishes having touched ``src/`` without ``tests/`` gets one bounded
+    test-authoring follow-up task. Defaults to ``True`` - an unattended run
+    that trips the merge gate's test-evidence check should not need an
+    operator to notice and re-drive it by hand.
+    """
+    if raw is None:
+        return OrchestrationConfig()
+    if not isinstance(raw, dict):
+        raise SeedError(f"orchestration must be a mapping, got: {type(raw).__name__}")
+    test_followup_raw: object = cast("_StrObjDict", raw).get("test_followup", True)
+    if not isinstance(test_followup_raw, bool):
+        raise SeedError(f"orchestration.test_followup must be a bool, got: {type(test_followup_raw).__name__}")
+    return OrchestrationConfig(test_followup=test_followup_raw)
 
 
 def _parse_workspace(
@@ -1720,6 +1742,7 @@ def _parse_quality_gates(raw: object) -> QualityGatesConfig | None:
             "pii_allowlist_prefixes",
             ["FAKE", "TEST", "EXAMPLE", "DUMMY", "PLACEHOLDER", "LOCALHOST"],
         ),
+        run_config=_qg_bool("run_config", True),
         security_scan=_qg_bool("security_scan", False),
         security_scan_command=_qg_optional_str("security_scan_command"),
         coverage_delta=_qg_bool("coverage_delta", False),
@@ -1946,7 +1969,7 @@ def _parse_cost_envelopes(data: dict[str, object]) -> dict[str, dict[str, Any]]:
             )
         if "threshold_pct" in payload_dict:
             tp_raw = payload_dict["threshold_pct"]
-            if not isinstance(tp_raw, int | float) or not (0.0 < float(tp_raw) <= 1.0):
+            if not isinstance(tp_raw, (int, float)) or not (0.0 < float(tp_raw) <= 1.0):
                 raise SeedError(f"cost.envelopes.{name}.threshold_pct must be a number in (0, 1], got: {tp_raw!r}")
             norm["threshold_pct"] = float(tp_raw)
         if "model_allowlist" in payload_dict:
@@ -2001,11 +2024,11 @@ def _parse_max_agents(data: dict[str, object]) -> int:
     return max_agents_raw
 
 
-def _parse_model(data: dict[str, object]) -> object:
+def _parse_model(data: dict[str, object]) -> str | None:
     model_raw: object = data.get("model")
     if model_raw is not None and not isinstance(model_raw, str):
         raise SeedError(f"model must be a string, got: {type(model_raw).__name__}")
-    return model_raw
+    return cast("str | None", model_raw)
 
 
 def _parse_max_cost_per_agent(data: dict[str, object]) -> float:
@@ -2018,11 +2041,11 @@ def _parse_max_cost_per_agent(data: dict[str, object]) -> float:
     return val
 
 
-def _parse_optional_str_field(data: dict[str, object], field: str) -> object:
+def _parse_optional_str_field(data: dict[str, object], field: str) -> str | None:
     raw: object = data.get(field)
     if raw is not None and not isinstance(raw, str):
         raise SeedError(f"{field} must be a string path, got: {type(raw).__name__}")
-    return raw
+    return cast("str | None", raw)
 
 
 def _parse_mcp_servers(data: dict[str, object]) -> object:
@@ -2098,6 +2121,7 @@ _PARSED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "deployment_strategy",
         "evolution_enabled",
         "formal_verification",
+        "gate_repair_enabled",
         "github",
         "goal",
         "internal_llm_model",
@@ -2116,6 +2140,7 @@ _PARSED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "model_policy",
         "network",
         "notify",
+        "orchestration",
         "org_policies",
         "provider_availability",
         "quality_gates",
@@ -2242,7 +2267,17 @@ def parse_seed(path: Path) -> SeedConfig:
     if not isinstance(data_raw, dict):
         raise SeedError(f"Seed file must be a YAML mapping, got {type(data_raw).__name__}")
 
-    data: dict[str, object] = cast("_StrObjDict", data_raw)
+    committed: dict[str, object] = cast("_StrObjDict", data_raw)
+
+    # Run-scoped overrides are merged in from an untracked overlay rather than
+    # written into the file above. The committed file is read by a run and
+    # never written by one, so no commit an agent makes can carry it. With no
+    # overlay and no ``$BERNSTEIN_CONFIG_OVERRIDE`` this is the identity, and
+    # a setup that edits the committed file directly behaves as it always did.
+    try:
+        data: dict[str, object] = cast("_StrObjDict", resolve_effective_mapping(committed, config_path=path))
+    except RunOverlayError as exc:
+        raise SeedError(str(exc)) from exc
 
     _warn_unknown_top_level_keys(data)
 
@@ -2323,6 +2358,7 @@ def parse_seed(path: Path) -> SeedConfig:
     cluster = _parse_cluster(data.get("cluster"))
     session_cfg = _parse_session(data.get("session"))
     github_cfg = _parse_github(data.get("github"))
+    orchestration_cfg = _parse_orchestration(data.get("orchestration"))
     workspace = _parse_workspace(data.get("workspace"), data.get("repos"), path.parent)
     worktree_setup = _parse_worktree_setup(data.get("worktree_setup"))
     batch = _parse_batch(data.get("batch"))
@@ -2345,6 +2381,7 @@ def parse_seed(path: Path) -> SeedConfig:
     internal_llm_provider_raw = _validate_optional_str(data, "internal_llm_provider", "openrouter_free")
     internal_llm_model_raw = _validate_optional_str(data, "internal_llm_model", "nvidia/nemotron-3-super-120b-a12b")
     evolution_enabled_raw = _validate_optional_bool(data, "evolution_enabled", True)
+    gate_repair_enabled_raw = _validate_optional_bool(data, "gate_repair_enabled", True)
     judge_model_raw = _parse_optional_str_field(data, "judge_model")
     judge_provider_raw = _parse_optional_str_field(data, "judge_provider")
     model_fallback = _parse_model_fallback(data.get("model_fallback"))
@@ -2371,11 +2408,11 @@ def parse_seed(path: Path) -> SeedConfig:
         team_manifest_digest=team_manifest_digest,
         cli=cli,
         max_agents=max_agents_raw,
-        model=cast("str | None", model_raw),
+        model=model_raw,
         max_cost_per_agent=max_cost_per_agent,
         constraints=constraints,
         context_files=context_files,
-        agent_catalog=cast("str | None", agent_catalog_raw),
+        agent_catalog=agent_catalog_raw,
         catalogs=catalogs,
         mcp_servers=cast("dict[str, dict[str, Any]] | None", mcp_servers_raw),
         mcp_allowlist=mcp_allowlist if mcp_allowlist is not None else None,
@@ -2387,13 +2424,14 @@ def parse_seed(path: Path) -> SeedConfig:
         workspace=workspace,
         session=session_cfg,
         github=github_cfg,
+        orchestration=orchestration_cfg,
         worktree_setup=worktree_setup,
         secrets=secrets,
         key_rotation=key_rotation,
         quality_gates=quality_gates,
         formal_verification=formal_verification,
         model_policy=model_policy,
-        role_model_policy=cast("dict[str, dict[str, str]] | None", role_model_policy),
+        role_model_policy=cast(Any, role_model_policy),
         compliance=compliance,
         visual=visual,
         sandbox=sandbox,
@@ -2409,6 +2447,7 @@ def parse_seed(path: Path) -> SeedConfig:
         internal_llm_provider=internal_llm_provider_raw,
         internal_llm_model=internal_llm_model_raw,
         evolution_enabled=evolution_enabled_raw,
+        gate_repair_enabled=gate_repair_enabled_raw,
         judge_model=cast("str | None", judge_model_raw),
         judge_provider=cast("str | None", judge_provider_raw),
         model_fallback=model_fallback,

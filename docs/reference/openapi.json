@@ -3706,63 +3706,6 @@
         }
       }
     },
-    "/dashboard": {
-      "get": {
-        "summary": "Dashboard Page",
-        "description": "Serve the single-page web dashboard.",
-        "operationId": "dashboard_page_dashboard_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/dashboard/static/{asset_name}": {
-      "get": {
-        "summary": "Dashboard Static Asset",
-        "description": "Serve allow-listed static assets used by the web dashboard.",
-        "operationId": "dashboard_static_asset_dashboard_static__asset_name__get",
-        "parameters": [
-          {
-            "name": "asset_name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Asset Name"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/dashboard/data": {
       "get": {
         "summary": "Dashboard Data",
@@ -6119,7 +6062,7 @@
           "approvals"
         ],
         "summary": "List Approvals",
-        "description": "List all pending approval requests.",
+        "description": "List all pending approval requests across task-review and pre-spawn gates.",
         "operationId": "list_approvals_approvals_get",
         "responses": {
           "200": {
@@ -6592,7 +6535,7 @@
             "description": "Plan not found, or plan mode is not enabled on this server"
           },
           "409": {
-            "description": "Plan already decided"
+            "description": "Plan already decided, or the plan changed after it was rendered for review"
           },
           "422": {
             "description": "Validation Error",
@@ -6660,7 +6603,7 @@
             "description": "Plan not found, or plan mode is not enabled on this server"
           },
           "409": {
-            "description": "Plan already decided"
+            "description": "Plan already decided, or the plan changed after it was rendered for review"
           },
           "422": {
             "description": "Validation Error",
@@ -12522,63 +12465,6 @@
         }
       }
     },
-    "/api/v1/dashboard": {
-      "get": {
-        "summary": "Dashboard Page",
-        "description": "Serve the single-page web dashboard.",
-        "operationId": "dashboard_page_api_v1_dashboard_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dashboard/static/{asset_name}": {
-      "get": {
-        "summary": "Dashboard Static Asset",
-        "description": "Serve allow-listed static assets used by the web dashboard.",
-        "operationId": "dashboard_static_asset_api_v1_dashboard_static__asset_name__get",
-        "parameters": [
-          {
-            "name": "asset_name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Asset Name"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/dashboard/data": {
       "get": {
         "summary": "Dashboard Data",
@@ -14935,7 +14821,7 @@
           "approvals"
         ],
         "summary": "List Approvals",
-        "description": "List all pending approval requests.",
+        "description": "List all pending approval requests across task-review and pre-spawn gates.",
         "operationId": "list_approvals_api_v1_approvals_get",
         "responses": {
           "200": {
@@ -15408,7 +15294,7 @@
             "description": "Plan not found, or plan mode is not enabled on this server"
           },
           "409": {
-            "description": "Plan already decided"
+            "description": "Plan already decided, or the plan changed after it was rendered for review"
           },
           "422": {
             "description": "Validation Error",
@@ -15476,7 +15362,7 @@
             "description": "Plan not found, or plan mode is not enabled on this server"
           },
           "409": {
-            "description": "Plan already decided"
+            "description": "Plan already decided, or the plan changed after it was rendered for review"
           },
           "422": {
             "description": "Validation Error",
@@ -20120,6 +20006,52 @@
             "type": "string",
             "title": "Test Summary",
             "default": ""
+          },
+          "mechanism": {
+            "type": "string",
+            "title": "Mechanism",
+            "default": "task_review"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "default": ""
+          },
+          "default_action": {
+            "type": "string",
+            "title": "Default Action",
+            "default": ""
+          },
+          "timeout_at_iso": {
+            "type": "string",
+            "title": "Timeout At Iso",
+            "default": ""
+          },
+          "created_iso": {
+            "type": "string",
+            "title": "Created Iso",
+            "default": ""
+          },
+          "timeout_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout Seconds"
+          },
+          "unblocks": {
+            "type": "string",
+            "title": "Unblocks",
+            "default": "task completion and merge"
+          },
+          "resolution_endpoint": {
+            "type": "string",
+            "title": "Resolution Endpoint",
+            "default": ""
           }
         },
         "type": "object",
@@ -20129,7 +20061,7 @@
           "session_id"
         ],
         "title": "PendingApproval",
-        "description": "A single pending approval request."
+        "description": "A single pending approval request (task-level or pre-spawn)."
       },
       "PlanDecisionRequest": {
         "properties": {
@@ -20669,7 +20601,7 @@
           },
           "artifact_type": {
             "type": "string",
-            "pattern": "^(report|table|link)$",
+            "pattern": "^(report|table|link|finding)$",
             "title": "Artifact Type"
           },
           "poster": {
@@ -20711,6 +20643,41 @@
             "type": "string",
             "maxLength": 64,
             "title": "Link Kind",
+            "default": ""
+          },
+          "sarif_result": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Sarif Result"
+          },
+          "tool": {
+            "type": "string",
+            "maxLength": 1000,
+            "title": "Tool",
+            "default": ""
+          },
+          "tool_version": {
+            "type": "string",
+            "maxLength": 128,
+            "title": "Tool Version",
+            "default": ""
+          },
+          "pinned_ruleset_or_feed_digest": {
+            "type": "string",
+            "maxLength": 256,
+            "title": "Pinned Ruleset Or Feed Digest",
+            "default": ""
+          },
+          "invocation_argv_hash": {
+            "type": "string",
+            "maxLength": 256,
+            "title": "Invocation Argv Hash",
+            "default": ""
+          },
+          "target": {
+            "type": "string",
+            "maxLength": 4096,
+            "title": "Target",
             "default": ""
           }
         },

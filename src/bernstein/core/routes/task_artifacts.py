@@ -144,6 +144,15 @@ def _build_payload(body: TaskArtifactPost) -> ArtifactPayload:
         return ArtifactPayload.report(body.body)
     if body.artifact_type == "table":
         return ArtifactPayload.table(body.columns, body.rows)
+    if body.artifact_type == "finding":
+        return ArtifactPayload.finding(
+            body.sarif_result,
+            tool=body.tool,
+            tool_version=body.tool_version,
+            pinned_ruleset_or_feed_digest=body.pinned_ruleset_or_feed_digest,
+            invocation_argv_hash=body.invocation_argv_hash,
+            target=body.target,
+        )
     return ArtifactPayload.link(body.url, body.link_kind)
 
 

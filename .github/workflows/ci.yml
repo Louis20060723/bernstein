@@ -452,6 +452,11 @@ jobs:
           if [ -n "$CONFLICTS" ]; then
             exit 1
           fi
+      - name: Reject a UTF-8 BOM in a committed text file (#4500)
+        # Three fragments in a row (#4429, #4430, #4493) arrived BOM-prefixed
+        # and this job passed all three. Pure stdlib and git, so it runs here
+        # ahead of the bootstrap step rather than waiting on the toolchain.
+        run: python3 scripts/check_bom.py
       - name: Check Python syntax in scripts/
         run: |
           ERRORS=""
@@ -2057,10 +2062,11 @@ jobs:
     # quarter of the suite per push instead of sharding, because its
     # `name:` was kept a literal, non-templated string on the assumption
     # that branch protection's required context depended on it. It does
-    # not: the repository ruleset requires exactly one status check,
-    # `CI gate` (confirmed via `gh api .../rules/branches/main` ->
-    # required_status_checks.contexts == ["CI gate"]; see the PR that
-    # unlocked this). Nothing reads a per-shard job's display name, so it
+    # not: the required contexts are `CI gate` and `shipped bundle matches
+    # the lockfile`, and no `test` cell is among them (the live list lives in
+    # required-check-canary.yml as BRANCH_PROTECTION_CONTEXTS_JSON, which the
+    # scheduled audit compares against `gh api .../rules/branches/main`).
+    # Nothing reads a per-shard job's display name, so it
     # can template like `test`'s does. required-check-canary.yml still
     # locks the name branch protection actually depends on
     # (`ci-gate.name == "CI gate"`). Per-push macOS coverage now shards

@@ -9,7 +9,7 @@
   "properties": {
     "task_id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9_.:-]+$"},
     "key": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
-    "artifact_type": {"type": "string", "enum": ["report", "table", "link"]},
+    "artifact_type": {"type": "string", "enum": ["report", "table", "link", "finding"]},
     "poster": {"type": "string", "minLength": 1, "maxLength": 256},
     "body": {"type": "string", "minLength": 1, "maxLength": 60000},
     "columns": {
@@ -28,7 +28,13 @@
       }
     },
     "url": {"type": "string", "minLength": 1, "maxLength": 4096},
-    "link_kind": {"type": "string", "enum": ["preview", "dashboard", "document"]}
+    "link_kind": {"type": "string", "enum": ["preview", "dashboard", "document"]},
+    "sarif_result": {"type": "object"},
+    "tool": {"type": "string", "minLength": 1, "maxLength": 256},
+    "tool_version": {"type": "string", "maxLength": 128},
+    "pinned_ruleset_or_feed_digest": {"type": "string", "maxLength": 256},
+    "invocation_argv_hash": {"type": "string", "maxLength": 256},
+    "target": {"type": "string", "maxLength": 4096}
   },
   "allOf": [
     {
@@ -42,6 +48,10 @@
     {
       "if": {"properties": {"artifact_type": {"const": "link"}}, "required": ["artifact_type"]},
       "then": {"required": ["url", "link_kind"]}
+    },
+    {
+      "if": {"properties": {"artifact_type": {"const": "finding"}}, "required": ["artifact_type"]},
+      "then": {"required": ["sarif_result"]}
     }
   ]
 }

@@ -241,3 +241,74 @@ class TestProgress:
         # Posting five reports does not move the chain-computed progress vector.
         assert after["vector_hash"] == before["vector_hash"]
         assert after["earned_steps"] == 0
+
+
+class TestFindingArtifactRoute:
+    """Finding artifact reachability tests (#4533)."""
+
+    def _sample_sarif(self) -> dict[str, object]:
+        return {
+            "ruleId": "PY-SQLI-001",
+            "message": {"text": "SQL injection vulnerability"},
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": "src/db.py"},
+                        "region": {
+                            "startLine": 42,
+                            "endLine": 42,
+                            "startColumn": 5,
+                            "endColumn": 30,
+                            "snippet": {"text": "cursor.execute(f'SELECT {query}')"},
+                        },
+                    }
+                }
+            ],
+        }
+
+    async def test_http_post_of_finding_artifact_succeeds_and_returns_content(self, app, client: AsyncClient) -> None:
+        task_id = await _create_claimed_task(client, app, "finding task", "worker-1")
+        sarif = self._sample_sarif()
+
+        resp = await _post_artifact(
+            client,
+            task_id,
+            "worker-1",
+            key="sec-finding",
+            artifact_type="finding",
+            sarif_result=sarif,
+            tool="bandit",
+            tool_version="1.7.5",
+            pinned_ruleset_or_feed_digest="sha256:" + "a" * 64,
+            invocation_argv_hash="sha256:" + "b" * 64,
+            target="git:head",
+        )
+
+        assert resp.status_code == 201, resp.text
+        data = resp.json()
+        assert data["artifact_type"] == "finding"
+        assert data["key"] == "sec-finding"
+        assert data["version"] == 1
+        assert data["verified"] is True
+        assert data["content"] is not None
+        assert data["content"]["type"] == "finding"
+        assert "address" in data["content"]
+        assert data["content"]["identity"]["rule_id"] == "PY-SQLI-001"
+
+    async def test_http_post_of_malformed_finding_is_422_not_untyped_blob(self, app, client: AsyncClient) -> None:
+        task_id = await _create_claimed_task(client, app, "bad finding task", "worker-1")
+        # Missing required locations[0].physicalLocation
+        bad_sarif = {"ruleId": "BAD-001"}
+
+        resp = await _post_artifact(
+            client,
+            task_id,
+            "worker-1",
+            key="bad-finding",
+            artifact_type="finding",
+            sarif_result=bad_sarif,
+            tool="bandit",
+        )
+
+        assert resp.status_code == 422, resp.text
+        assert "finding SARIF result is missing required field" in resp.json()["detail"]

@@ -62,11 +62,6 @@ MATCH_ANYTHING = ("*", "**")
 #: `test_queue_reporting_web_lanes_can_actually_be_required` re-reads the
 #: workflow and fails if the trigger is missing or filtered.
 QUEUE_REPORTING_WEB_LANES = {
-    "spa-bundle-freshness.yml": (
-        "The bundle gate. #4010 merged with it red because the lane was advisory, and main "
-        "went red behind eleven queue entries. #4028 added the merge_group trigger so that "
-        "`shipped bundle matches the lockfile` can be made a required context."
-    ),
     "typecheck-ts.yml": (
         "`tsc --noEmit` over the TypeScript packages, `web/` among them. #4010's shape one "
         "directory over: ci.yml paths-ignores the TypeScript trees, `CI gate` is the only "
@@ -327,20 +322,24 @@ def test_emits_any_discriminates(tmp_path: Path) -> None:
     assert _emits_any(wf, {}, ("CI gate",)) is False
 
 
-def test_the_bundle_gate_is_not_exempt_as_a_gate_emitter(
+def test_the_bundle_gate_publishes_a_required_context(
     queue_required_contexts: tuple[str, ...],
 ) -> None:
-    """It is accounted for by the allow-list, not by publishing `CI gate`.
+    """It is accounted for by the gate itself now, not by the allow-list.
 
-    Pins the reason the lane is in the first dict. If it ever started
-    emitting a required context the entry would become dead weight, and
-    worse, the canary in
-    ``tests/unit/test_required_check_canary_workflow_yaml.py`` would already
-    be failing for a different reason.
+    The lane used to sit in ``QUEUE_REPORTING_WEB_LANES`` - requirable, not
+    required. It is required now, so that entry would be dead weight, and
+    this pins the replacement: the lane can fail on a ``web/**`` change *and*
+    publishes a context branch protection demands.
+
+    ``queue_required_contexts`` is read from
+    ``docs/operations/merge-queue-ruleset.json``, so this also fails if that
+    mirror drifts from the live ruleset again - which is how the lane spent
+    2026-08-25 required in production and unrequired in the tree.
     """
     path = WORKFLOWS / "spa-bundle-freshness.yml"
     assert _can_run_on_a_web_change(_load(path)) is True
-    assert _emits_any(path, _load(path), queue_required_contexts) is False
+    assert _emits_any(path, _load(path), queue_required_contexts) is True
 
 
 def test_no_web_triggerable_lane_is_advisory_only(
@@ -890,3 +889,63 @@ def test_event_gated_required_jobs_declare_their_merge_group_tolerance(
         "by the roll-up and wedges the queue. Add the job to DOCS_ONLY_SKIPPABLE, MACOS_GATED or PUSH_ONLY with "
         "the reason its skip is safe, or drop the event condition."
     )
+
+
+def test_every_queue_required_context_emits_on_all_pull_requests_unconditionally(
+    queue_required_contexts: tuple[str, ...],
+) -> None:
+    """Every required check must emit on all PRs without being wedged by a paths filter (#4557).
+
+    If an emitting workflow has a `paths` or `paths-ignore` filter on `pull_request`, it
+    must have a companion stub (like `ci.yml` + `ci-gate-stub.yml`) covering non-matching paths,
+    or non-matching PRs will wait forever for `Required status check '<name>' is expected.`
+    """
+    for context in queue_required_contexts:
+        emitters: list[tuple[str, dict[str, Any]]] = []
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            try:
+                doc = _load(path)
+            except (AssertionError, yaml.YAMLError):
+                continue
+            text = path.read_text(encoding="utf-8")
+            jobs = doc.get("jobs")
+            if not isinstance(jobs, dict):
+                continue
+            for key, job in jobs.items():
+                if not isinstance(job, dict):
+                    continue
+                # Check if this job publishes `context`
+                name = job.get("name", key)
+                strategy = job.get("strategy")
+                is_emitter = False
+                if name == context or f"--name {context}" in text or (isinstance(name, str) and f"'{context}'" in name):
+                    is_emitter = True
+                elif isinstance(strategy, dict) and "${{" in str(name):
+                    matrix = strategy.get("matrix", {})
+                    includes = matrix.get("include", []) if isinstance(matrix, dict) else []
+                    for cell in includes:
+                        if isinstance(cell, dict):
+                            rendered = name
+                            for k, v in cell.items():
+                                rendered = rendered.replace(f"${{{{ matrix.{k} }}}}", str(v))
+                                rendered = rendered.replace(f"${{{{matrix.{k}}}}}", str(v))
+                            if rendered == context:
+                                is_emitter = True
+                                break
+                if is_emitter:
+                    pr_trigger = _triggers(doc).get("pull_request")
+                    emitters.append((path.name, pr_trigger if isinstance(pr_trigger, dict) else {}))
+
+        assert emitters, f"Required context {context!r} has no emitting workflow on pull_request"
+
+        # Check if at least one emitter is unfiltered, or if emitters have complementary stubs
+        unfiltered_emitters = [
+            wf for wf, trigger in emitters if not trigger.get("paths") and not trigger.get("paths-ignore")
+        ]
+        has_stub = any("stub" in wf for wf, _ in emitters)
+
+        assert unfiltered_emitters or has_stub, (
+            f"Required context {context!r} is only emitted by path-filtered workflows {[wf for wf, _ in emitters]} "
+            f"without an unfiltered trigger or companion stub workflow. Every PR outside the path filter will "
+            f"be permanently wedged waiting for {context!r}. See docs/operations/merge-queue.md step 0."
+        )

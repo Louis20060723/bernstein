@@ -1180,6 +1180,12 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
         rows: list[list[str]] | None = None,
         url: str = "",
         link_kind: str = "",
+        sarif_result: dict[str, Any] | None = None,
+        tool: str = "",
+        tool_version: str = "",
+        pinned_ruleset_or_feed_digest: str = "",
+        invocation_argv_hash: str = "",
+        target: str = "",
     ) -> str:
         """Attach a journal-anchored artifact to a task you hold the claim for.
 
@@ -1196,7 +1202,8 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
             task_id: The task to attach the artifact to. You must hold its claim.
             key: The artifact slot; reposting a key appends a new version.
             artifact_type: One of ``report`` (markdown ``body``), ``table``
-                (``columns`` + ``rows``), or ``link`` (``url`` + ``link_kind``).
+                (``columns`` + ``rows``), ``link`` (``url`` + ``link_kind``),
+                or ``finding`` (``sarif_result`` + provenance).
             poster: Your claim identity; posting against a task you do not hold
                 is refused and the refusal is audit-recorded.
             body: Markdown body, for ``report`` artifacts.
@@ -1205,6 +1212,12 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
             url: The URL, for ``link`` artifacts.
             link_kind: The declared link kind - ``preview`` / ``dashboard`` /
                 ``document`` - for ``link`` artifacts.
+            sarif_result: Normalized SARIF 2.1.0 result object, for ``finding`` artifacts.
+            tool: Scanner/linter name, for ``finding`` artifacts.
+            tool_version: Scanner version string, for ``finding`` artifacts.
+            pinned_ruleset_or_feed_digest: Ruleset/feed digest, for ``finding`` artifacts.
+            invocation_argv_hash: Hash of tool invocation arguments, for ``finding`` artifacts.
+            target: Target path or git ref, for ``finding`` artifacts.
 
         Returns:
             JSON of the chain-anchored artifact record (``key``, ``version``,
@@ -1232,6 +1245,18 @@ def _register_action_tools(mcp: FastMCP[None], server_url: str) -> None:
             args["url"] = url
         if link_kind:
             args["link_kind"] = link_kind
+        if sarif_result is not None:
+            args["sarif_result"] = sarif_result
+        if tool:
+            args["tool"] = tool
+        if tool_version:
+            args["tool_version"] = tool_version
+        if pinned_ruleset_or_feed_digest:
+            args["pinned_ruleset_or_feed_digest"] = pinned_ruleset_or_feed_digest
+        if invocation_argv_hash:
+            args["invocation_argv_hash"] = invocation_argv_hash
+        if target:
+            args["target"] = target
         err = _validate_or_error("bernstein_post_artifact", args)
         if err is not None:
             return _validation_error_response(err)

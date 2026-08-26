@@ -180,13 +180,30 @@ def _register_mcp_discovery(workdir: Path) -> None:
     access to the Bernstein orchestration tools (bernstein_status, etc.)
     without manual configuration.
 
+    The file is written into the work tree because Claude Code reads it from
+    there and nowhere else, and is registered in the repository's local git
+    excludes so it still cannot be staged. See
+    :mod:`bernstein.core.git.local_exclude` for why this path is the sole
+    exemption from "run configuration lives outside the work tree".
+
     Args:
         workdir: Project root directory.
     """
     import json as _json
 
+    from bernstein.core.git.local_exclude import register_run_excludes
+
     mcp_path = workdir / ".claude" / "mcp.json"
     mcp_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # This is the one run-owned file that has to live inside the work tree:
+    # Claude Code resolves it at a fixed project-local path and takes no
+    # argument pointing elsewhere. Registering it in the repository's
+    # ``info/exclude`` keeps a broad ``git add -A`` from staging it, so the
+    # "run configuration is never part of a change" invariant holds for it
+    # too. Done before the early return below so the exclusion is in place
+    # even on the run where the file needed no rewrite (issue #4485).
+    register_run_excludes(workdir)
 
     existing: dict[str, object] = {}
     if mcp_path.exists():
@@ -1015,7 +1032,7 @@ def _supervisor_should_stand_down(workdir: Path) -> str | None:
 
     Only POSITIVE evidence counts, because the default has to be to recover: a
     supervisor that withholds a restart on a merely ambiguous reading leaves the
-    run with no orchestrator and nothing to notice, permanently. Two signals
+    run with no orchestrator and nothing to notice, permanently. Three signals
     qualify:
 
     * ``.sdd/runtime/draining`` -- written by ``DrainCoordinator._phase_freeze``
@@ -1024,6 +1041,17 @@ def _supervisor_should_stand_down(workdir: Path) -> str | None:
     * ``watchdog.pid`` no longer naming this process -- we have been superseded
       or killed (teardown SIGTERMs it first), so we are not the supervisor of
       record any more and must not act as one.
+    * the run this supervisor's owner record names already journaled
+      ``run_completed`` -- written only by ``Orchestrator.run()``'s own
+      shutdown sequence, right before the process exits on a clean quiescence
+      self-stop (issue #4445). A crash never reaches that code: the process
+      dies before it can journal anything, so the row is absent and the
+      ordinary restart default is untouched. Reading the journal directly
+      (rather than the audit-chain closure marker ``_restart_spawner``
+      reconciles as bookkeeping) keeps this cheap enough to call every poll --
+      the marker it looks for is written once, at the very end of one run's
+      own small journal, not re-derived by re-verifying the whole project's
+      audit history.
 
     A missing pidfile for a SUPERVISED process is deliberately not on this list.
     It is the ordinary aftermath of a crash plus ``bernstein doctor --fix``, and
@@ -1040,6 +1068,17 @@ def _supervisor_should_stand_down(workdir: Path) -> str | None:
             return None
         if recorded != os.getpid():
             return f"watchdog.pid names pid {recorded}, not this supervisor ({os.getpid()})"
+
+    from bernstein.core.orchestration.run_closure_owner import read_spawner_run_owner
+    from bernstein.core.replay.journal import contained_run_journal, load_events
+
+    sdd_dir = workdir / ".sdd"
+    owner = read_spawner_run_owner(sdd_dir)
+    if owner is not None:
+        journal_path = contained_run_journal(sdd_dir / "runs", owner.run_id)
+        events = load_events(journal_path).events if journal_path is not None else []
+        if events and events[-1].get("event") == "run_completed":
+            return f"run {owner.run_id} already self-stopped cleanly (run_completed journaled)"
     return None
 
 

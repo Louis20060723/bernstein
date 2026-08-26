@@ -53,6 +53,7 @@ from bernstein.core.bandit_router import BanditRouter
 from bernstein.core.batch_api import ProviderBatchManager
 from bernstein.core.bulletin import BulletinBoard, BulletinMessage, SignalActionFailure
 from bernstein.core.cluster import NodeHeartbeatClient
+from bernstein.core.config.run_overlay import effective_mtime
 from bernstein.core.context import refresh_knowledge_base
 from bernstein.core.context_degradation_detector import (
     ContextDegradationConfig,
@@ -434,6 +435,11 @@ class Orchestrator:
         # ``_check_zero_terminal_stall``; see core.orchestration.run_stall.
         self._run_stall_state = RunStallState()
         self._run_stall_stopped: bool = False
+        # No-progress window for the done>0 wedged-claim pattern (#4453).
+        # Separate from ``_run_stall_state`` because the two detectors
+        # have different preconditions (zero-terminal vs done>0).
+        self._progress_stall_state = RunStallState()
+        self._progress_stall_stopped: bool = False
         self._cached_critical_path_ids: set[str] = set()
         self._dependency_scanner = DependencyVulnerabilityScanner(
             workdir,
@@ -457,6 +463,12 @@ class Orchestrator:
         self._last_replenish_ts: float = 0.0
         # Run completion summary state
         self._summary_written: bool = False
+        # One-shot latch (issue #4462): True once this run has scheduled its
+        # one bounded test-authoring follow-up task. Never reset for the
+        # life of this process, so the quiescence the follow-up task's OWN
+        # completion produces can never schedule a second one. See
+        # core.orchestration.test_followup and _maybe_schedule_test_followup.
+        self._test_followup_scheduled: bool = False
         # Guards the FINAL (shutdown-final) retrospective regeneration so it
         # only ever runs once per process, regardless of which terminal path
         # triggers it (tick-loop drain in run(), or the tick-level
@@ -808,10 +820,13 @@ class Orchestrator:
         # detect when agents modify its own code and restart in-place.
         self._source_mtime: float = time.time()
 
-        # Config hot-reload: track bernstein.yaml mtime so mutable config
-        # fields (max_agents, budget_usd) are picked up without restart.
+        # Config hot-reload: track the newest mtime across the committed
+        # bernstein.yaml and its untracked overlay, so mutable config fields
+        # (max_agents, budget_usd) are picked up without restart. Both layers
+        # count: an overlay write is the only kind of configuration write a
+        # run is allowed to make (issue #4485).
         self._config_path: Path = resolve_seed_path(workdir)
-        self._config_mtime: float = self._config_path.stat().st_mtime if self._config_path.exists() else 0.0
+        self._config_mtime: float = effective_mtime(self._config_path)
 
         # Memory leak detection: sampled every few ticks
         self._memory_guard = MemoryGuard()
@@ -829,6 +844,8 @@ class Orchestrator:
         # orchestrator, so the hook is applied here via a setter.
         if hasattr(self._spawner, "set_merge_queue"):
             self._spawner.set_merge_queue(self._merge_queue)
+        if hasattr(self._spawner, "set_quality_gate_config"):
+            self._spawner.set_quality_gate_config(self._quality_gate_config)
 
         # Convergence guard: blocks spawn waves when merge queue, active
         # agent count, error rate, or spawn rate exceed safe thresholds.
@@ -1047,7 +1064,7 @@ class Orchestrator:
         try:
             if not self._config_path.exists():
                 return False
-            current_mtime = self._config_path.stat().st_mtime
+            current_mtime = effective_mtime(self._config_path)
             if current_mtime <= self._config_mtime:
                 return False
         except OSError:
@@ -1519,9 +1536,31 @@ class Orchestrator:
             len(tasks_by_status.get("failed", [])),
         )
 
+        # 1c. Build the task graph. Construction is deliberately un-gated:
+        #     the readiness filter just below and the critical-path claim
+        #     ordering in step 1c-ii both run on every tick and both need a
+        #     graph. A fast tick already paid for the identical construction
+        #     inside ``DependencyValidator.critical_path``, which is only
+        #     ``TaskGraph(tasks).critical_path()``, so building it once here
+        #     and reusing it costs a fast tick nothing and drops a normal
+        #     tick from two constructions to one. What stays gated behind
+        #     _run_normal is the expensive work built on top of the graph:
+        #     analyse(), full dependency validation, the snapshot write
+        #     (step 1c-ii) and warm-pool preparation (step 3).
+        all_tasks = list(itertools.chain.from_iterable(tasks_by_status.values()))
+        self._latest_tasks_by_id = {task.id: task for task in all_tasks}
+
+        task_graph = TaskGraph(all_tasks)
+        # A declared cycle is opened by dropping one edge, but the dropped
+        # edge stays in the dependent's depends_on. Without exempting it
+        # here every task on the cycle would fail the readiness filter
+        # forever and the board would stay wedged - the failure #4287
+        # describes. Keyed (dependent, dependency) to match the lookup below.
+        broken_deps = {(b.edge.target, b.edge.source) for b in task_graph.cycle_breaks}
+
         # The server returns tasks matching the requested status; apply the
         # dependency filter here for "open" tasks.
-        done_tasks = tasks_by_status["done"]
+        done_tasks = tasks_by_status.get("done", [])
         # A dependency is satisfied by any terminal-success status, not just
         # "done": once a done task's agent is reaped and its branch merged,
         # the task moves to "closed" (the store soft-archives via status).
@@ -1532,8 +1571,8 @@ class Orchestrator:
         now = time.time()
         open_tasks = [
             t
-            for t in tasks_by_status["open"]
-            if all(dep in done_ids for dep in t.depends_on)
+            for t in tasks_by_status.get("open", [])
+            if all(dep in done_ids or (t.id, dep) in broken_deps for dep in t.depends_on)
             # Skip tasks with future created_at (retry backoff)
             and t.created_at <= now
         ]
@@ -1612,15 +1651,11 @@ class Orchestrator:
             # Check for file-based approval grant
             self._check_workflow_approval()
 
-        # 1c. Build task graph and compute optimal parallelism
-        #     Graph analysis + dependency validation are expensive - gate behind
-        #     _run_normal. The all_tasks list and task ID cache are always needed.
-        all_tasks = list(itertools.chain.from_iterable(tasks_by_status.values()))
-        self._latest_tasks_by_id = {task.id: task for task in all_tasks}
-
-        task_graph: TaskGraph | None = None
+        # 1c-ii. Analyse the graph and validate dependencies. Both walk the
+        #        board repeatedly and the snapshot write touches disk, so
+        #        they are gated behind _run_normal; the graph they run on
+        #        was built above because every tick needs one.
         if _run_normal:
-            task_graph = TaskGraph(all_tasks)
             analysis = task_graph.analyse()
             dep_validator = DependencyValidator()
             dep_validation = dep_validator.validate(all_tasks)
@@ -1635,7 +1670,7 @@ class Orchestrator:
                 )
             for warning in dep_validation.warnings:
                 logger.warning("Dependency validation: %s", warning)
-            critical_path_ids = set(dep_validator.critical_path(all_tasks))
+            critical_path_ids = set(task_graph.critical_path())
             # Cache for use in fast ticks
             self._cached_critical_path_ids = critical_path_ids
 
@@ -1672,7 +1707,7 @@ class Orchestrator:
             # so reusing only the cache from the last normal tick left the
             # first spawn batch without the critical-path priority boost
             # and served stale boosts to tasks created between normal ticks.
-            critical_path_ids = set(DependencyValidator().critical_path(all_tasks))
+            critical_path_ids = set(task_graph.critical_path())
             self._cached_critical_path_ids = critical_path_ids
 
         # 3. Count alive agents, spawn if capacity (capped by graph parallel width)
@@ -1711,7 +1746,12 @@ class Orchestrator:
         alive_count = sum(1 for a in self._agents.values() if a.status != "dead")
         result.active_agents = alive_count
 
-        if task_graph is not None:
+        # Warm-pool preparation creates worktree and adapter capacity, so it
+        # is normal-tick work. It used to ride on ``task_graph is not None``,
+        # which only held on a normal tick back when the graph was built
+        # inside the gate; the condition is spelled out now that the graph is
+        # always available.
+        if _run_normal:
             prepare_speculative_warm_pool(self, task_graph, all_tasks)
 
         # 3a. Build alive-per-role map for task distribution prioritization.
@@ -2108,7 +2148,8 @@ class Orchestrator:
         # summary generation below; quiescence detection, the settle-window
         # check, the self-stop, and shutdown-final regeneration re-run on
         # every quiescent tick until confirmed.
-        if not self._config.evolve_mode and result.open_tasks == result.active_agents == 0:
+        _raw_open = len(tasks_by_status.get("open", []))
+        if not self._config.evolve_mode and result.open_tasks == result.active_agents == 0 and _raw_open == 0:
             refreshed_tasks_by_status = tasks_by_status
             try:
                 refreshed_tasks_by_status = fetch_all_tasks(self._client, base)
@@ -2322,6 +2363,14 @@ class Orchestrator:
                                 len(_active_holds),
                                 self._tick_count,
                                 _hold_reasons,
+                            )
+                        elif self._maybe_schedule_test_followup(settled.get("done", [])):
+                            logger.info(
+                                "Quiescence confirmed after %.1fs settle window (tick #%d) but a "
+                                "bounded test-authoring follow-up was just scheduled - "
+                                "deferring self-stop",
+                                _settle_s,
+                                self._tick_count,
                             )
                         else:
                             logger.info(
@@ -2651,6 +2700,85 @@ class Orchestrator:
         self._closure_outcome = RunClosureOutcome.FAILED
         self._regenerate_final_retrospective(trigger_path="tick-stalled-run-self-stop")
         self._running = False
+
+    def _maybe_schedule_test_followup(self, done_tasks: list[Task]) -> bool:
+        """Schedule one bounded test-authoring follow-up if this run needs it (#4462).
+
+        Called from the confirmed-quiescence self-stop branch of the tick's
+        step-8b handling, before the run would otherwise stop. Returns True
+        iff a follow-up task was just created - the caller must skip
+        self-stopping this tick when it is, since the run now has one more
+        bounded task to execute before it is actually finished.
+
+        The ``_test_followup_scheduled`` one-shot latch means a later
+        quiescence in this same orchestrator process - including the one the
+        follow-up task's own completion produces - never schedules a second
+        one (no loops), regardless of what that follow-up's own diff looks
+        like.
+        """
+        from bernstein.core.orchestration.test_followup import (
+            build_followup_goal,
+            diff_name_only,
+            evaluate_test_followup,
+            resolve_run_branch,
+            resolve_test_followup_enabled,
+        )
+
+        enabled = resolve_test_followup_enabled(self._config.test_followup_enabled)
+        branch: str | None = None
+        changed: tuple[str, ...] = ()
+        if enabled and not self._test_followup_scheduled:
+            try:
+                from bernstein.core.git.git_basic import resolve_default_branch
+
+                branch = resolve_run_branch(self._workdir, done_tasks)
+                if branch is not None:
+                    base_branch = resolve_default_branch(self._workdir)
+                    changed = diff_name_only(self._workdir, base_branch, branch)
+            except Exception:
+                logger.exception("test_followup: branch-diff lookup failed - skipping")
+                branch = None
+
+        decision = evaluate_test_followup(
+            enabled=enabled,
+            already_scheduled=self._test_followup_scheduled,
+            changed_files=changed,
+        )
+        if not decision.should_schedule:
+            logger.debug("test_followup: not scheduling (%s)", decision.reason)
+            return False
+        if branch is None:
+            # The diff shape says a follow-up is warranted, but no completed
+            # task in this run has a git branch left to diff (already merged
+            # and cleaned up, or a merge_strategy that never leaves one).
+            # Fail closed rather than guessing which branch to target.
+            logger.warning("test_followup: src-without-tests diff detected but no run branch was resolvable")
+            return False
+
+        goal = build_followup_goal(decision.src_files)
+        try:
+            response = self._client.post(
+                f"{self._config.server_url}/tasks",
+                json={
+                    "title": "Add tests for untested source change",
+                    "description": goal,
+                    "role": "qa",
+                    "priority": 2,
+                    "metadata": {"origin": "test_followup", "source_branch": branch},
+                },
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("test_followup: failed to create follow-up task: %s", exc)
+            return False
+
+        self._test_followup_scheduled = True
+        logger.info(
+            "test_followup: scheduled one bounded test-authoring follow-up on %s (%d src file(s) without tests)",
+            branch,
+            len(decision.src_files),
+        )
+        return True
 
     def _regenerate_final_retrospective(self, trigger_path: str) -> None:
         """Regenerate the FINAL retrospective and summary.json from final event state.
@@ -4365,12 +4493,13 @@ class Orchestrator:
         return unclaimed
 
     def _release_stale_claims(self, claimed_tasks: list[Task]) -> int:
-        """Fail claimed tasks that have been stuck longer than the timeout.
+        """Release claimed tasks whose agent is dead or whose claim is stale.
 
-        When an agent dies silently (no crash signal, no heartbeat timeout),
-        its claimed tasks stay in "claimed" forever.  This method detects
-        tasks with no matching live agent that have exceeded the stale claim
-        timeout and marks them failed so they can be retried.
+        Two paths:
+        - Dead/gone agent: retry immediately via ``_retry_or_fail_task``.
+          The agent is confirmed gone (not tracked, or marked dead), so
+          waiting for a timeout is pointless.
+        - Live but slow agent: fail after ``stale_claim_timeout_s``.
 
         Args:
             claimed_tasks: Tasks with status "claimed" from the current tick.
@@ -4382,37 +4511,54 @@ class Orchestrator:
         timeout = self._config.stale_claim_timeout_s
         released = 0
         for task in claimed_tasks:
-            # Skip tasks that have a known live agent in this session
-            if task.id in self._task_to_session:
-                agent_id = self._task_to_session[task.id]
-                agent = self._agents.get(agent_id)
-                if agent is not None and agent.status != "dead":
-                    continue
+            agent_id = self._task_to_session.get(task.id)
+            agent = self._agents.get(agent_id) if agent_id is not None else None
+            agent_dead = agent is None or agent.status == "dead"
 
-            # Use claimed_at (when available) to measure actual time in claimed
-            # state.  Fall back to created_at for legacy tasks that pre-date the
-            # claimed_at field - this is conservative (over-counts) but safe.
-            claim_epoch = task.claimed_at if task.claimed_at is not None else task.created_at
-            age_s = now - claim_epoch
-            if age_s < timeout:
+            if agent_dead:
+                # Agent confirmed gone — reclaim immediately, no timeout wait.
+                try:
+                    self._retry_or_fail_task(
+                        task.id,
+                        reason=("Dead agent: claimed task held by agent no longer tracked (or confirmed dead)"),
+                    )
+                    released += 1
+                    logger.warning(
+                        "Immediately reclaimed task %s (%s) from dead/gone agent",
+                        task.id,
+                        task.title,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to reclaim task %s from dead agent",
+                        task.id,
+                        exc_info=True,
+                    )
                 continue
 
-            try:
-                fail_task(
-                    self._client,
-                    self._config.server_url,
-                    task.id,
-                    reason=f"Stale claim: task stuck in claimed state for {age_s / 60:.0f}m with no live agent",
-                )
-                released += 1
-                logger.warning(
-                    "Released stale claimed task %s (%s) - stuck for %.0fm",
-                    task.id,
-                    task.title,
-                    age_s / 60,
-                )
-            except Exception:
-                logger.debug("Failed to release stale task %s", task.id, exc_info=True)
+            # Agent is alive but the claim may be stale (slow agent).
+            if task.id in self._task_to_session:
+                claim_epoch = task.claimed_at if task.claimed_at is not None else task.created_at
+                age_s = now - claim_epoch
+                if age_s < timeout:
+                    continue
+
+                try:
+                    fail_task(
+                        self._client,
+                        self._config.server_url,
+                        task.id,
+                        reason=f"Stale claim: task stuck in claimed state for {age_s / 60:.0f}m with no live agent",
+                    )
+                    released += 1
+                    logger.warning(
+                        "Released stale claimed task %s (%s) - stuck for %.0fm",
+                        task.id,
+                        task.title,
+                        age_s / 60,
+                    )
+                except Exception:
+                    logger.debug("Failed to release stale task %s", task.id, exc_info=True)
 
         if released:
             logger.warning("Released %d stale claimed task(s)", released)
@@ -6723,6 +6869,15 @@ if __name__ == "__main__":
             # bernstein.yaml never reached the runtime object and the
             # self-evolution loop ran regardless of the seed (#config-drift).
             evolution_enabled=getattr(seed, "evolution_enabled", True) if seed else True,
+            # Threads ``orchestration.test_followup`` from bernstein.yaml
+            # (issue #4462); see core.orchestration.test_followup for the
+            # env-override resolution applied when this is actually used.
+            test_followup_enabled=(
+                getattr(getattr(seed, "orchestration", None), "test_followup", True) if seed else True
+            ),
+            # Issue #4463: top-level ``gate_repair_enabled`` key in
+            # bernstein.yaml; BERNSTEIN_GATE_REPAIR overrides at runtime.
+            gate_repair_enabled=getattr(seed, "gate_repair_enabled", True) if seed else True,
         )
 
         if args.cells > 1:

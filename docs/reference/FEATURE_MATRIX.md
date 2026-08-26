@@ -188,7 +188,7 @@ test, and a row naming a command the CLI no longer registers fails it too.
 | [Fleet dashboard](../operations/fleet.md) | Full | 3 | `bernstein fleet [--web HOST:PORT]` cross-session multi-instance view (`core/fleet/`) |
 | [Notification sinks](../operations/notifications.md) | Full | 3 | `bernstein notify test --sink <id>` pluggable notification backends (`core/notifications/`) |
 | [PR review responder](../operations/review-responder.md) | Full | 3 | `bernstein review-responder start/status/tick` auto-responds to PR review comments (`core/review_responder/`) |
-| [Review pipeline DSL](../operations/review-pipeline.md) | Full | 3 | `bernstein review --pipeline review.yaml` YAML-driven multi-phase review (`core/quality/review_pipeline/`) |
+| [Review pipeline DSL](../operations/review-pipeline.md) | Full | 3 | `bernstein review --pipeline review.yaml` YAML-driven multi-phase review, plus the bounded `--fix --until-checks-green` contour and its per-pass receipts (`core/quality/review_pipeline/`) |
 | [Plan archival](../operations/plan-archival.md) | Full | 3 | `bernstein plan ls/show` list and inspect archived plans (`core/planning/lifecycle.py`) |
 | [Slack integration](../operations/slack-webhooks.md) | Full | 3 | Slash commands and events API endpoints |
 | [Webhook ingestion](../integrations/automation-bridge.md) | Full | 3 | `POST /webhooks/` for external event routing |
@@ -239,6 +239,7 @@ test, and a row naming a command the CLI no longer registers fails it too.
 | `bernstein doctor` | Full | 4 | Pre-flight health check |
 | `bernstein recap` | Full | 3 | Post-run summary |
 | `bernstein retro` | Full | 3 | Retrospective report |
+| `bernstein runs report` | Full | 3 | Finished runs projected from the work ledger and classified `pr-opened` / `gate-failed` / `no-changes` / `infra-error` / `wedged`, each with the evidence line it was read from |
 | `bernstein report commits/incident/postmortem` | Brief | 3 | Per-run markdown summaries: `commits` is per-agent commit attribution ([reference](../operations/commit-attribution.md)); `incident` correlates a timeline from logs, metrics, and traces; `postmortem` writes a structured report for a failed run. The group has no reference page of its own; `cli-reference.md` and `bernstein report --help` carry it |
 | `bernstein trace ID` | Full | 3 | Decision trace |
 | `bernstein logs` | Full | 3 | Agent log tail |

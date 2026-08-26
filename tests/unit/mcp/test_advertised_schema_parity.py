@@ -140,6 +140,13 @@ _SEEDS: dict[str, list[dict[str, Any]]] = {
             "url": "https://example.invalid/x",
             "link_kind": "preview",
         },
+        {
+            "task_id": "t-1",
+            "key": "k1",
+            "artifact_type": "finding",
+            "poster": "w",
+            "sarif_result": {"ruleId": "R1", "level": "warning"},
+        },
     ],
     "load_skill": [{"name": "backend"}],
     "bernstein_scenario": [
@@ -234,15 +241,16 @@ def test_post_artifact_advertises_its_conditional_shape() -> None:
         "report": ["body"],
         "table": ["columns", "rows"],
         "link": ["link_kind", "url"],
+        "finding": ["sarif_result"],
     }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("seed", _SEEDS["bernstein_post_artifact"], ids=["report", "table", "link"])
+@pytest.mark.parametrize("seed", _SEEDS["bernstein_post_artifact"], ids=["report", "table", "link", "finding"])
 async def test_a_call_matching_the_advertised_shape_reaches_the_task_server(seed: dict[str, Any]) -> None:
     """Filling the advertised conditional shape must not be refused up front.
 
-    The handler defaults the fields of the other two artifact types to the
+    The handler defaults the fields of the other artifact types to the
     empty string. Those defaults are absent from the advertised shape, so they
     must not be validated as if the caller had supplied them.
     """

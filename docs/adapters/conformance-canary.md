@@ -71,6 +71,28 @@ Running the check against a **downloaded** artifact bundle instead is
 bounded by the receipts artifact's 30-day retention. The in-workflow step
 has no such limit; it never touches the artifact store.
 
+## The proposal carries only what the canary regenerates
+
+The regeneration reaches `main` through a long-lived pull request on
+`bot/adapter-canary-last-green`. That branch is rebuilt each night by
+`scripts/canary_propose_branch.py` on `origin/main` **as fetched at commit
+time**, not on the workflow checkout.
+
+The distinction matters because the checkout is taken before the matrix
+probes every adapter, and a night that regenerates nothing exits before
+pushing, so the branch can sit at an older commit across nights. Anything
+merged into `main` inside that window then appears in the proposal as a
+*revert* of work the canary never touched, and a squash merge would land it.
+That is #4496: `docs/security/receipt-format-spec.md` came back to a form
+predating the edits #4489 had landed.
+
+Rebuilding on the fetched base removes the drift; the script then asserts the
+staged changed-file set against the merge base and fails if it is anything
+other than `src/bernstein/adapters/last_green.json` and
+`docs/adapters/conformance-canary.md`. A stray path stops the proposal rather
+than being dropped with a warning - dropping it would let a genuine projection
+bug leave the tree unnoticed, which is the fault this check exists to surface.
+
 ## What `last_green.json` rows must look like
 
 `load_last_green` validates each row at the JSON boundary instead of
@@ -192,15 +214,15 @@ covered under *Chronic-skip handling*.
 | Adapter | Binary | Last-green version | Verified | Receipt |
 |---|---|---|---|---|
 | agy | `agy` | 1.0.0 | 2026-07-11T05:57:23Z (not probed) | `006fb946868d` |
-| aider | `aider` | 0.86.2 | 2026-08-24T05:26:59Z | `440df6b99b1c` |
-| claude | `claude` | 2.1.241 | 2026-08-24T05:26:59Z | `a99a61e2d0d8` |
-| codex | `codex` | 0.149.1 | 2026-08-24T05:26:59Z | `25bae9a5a2ca` |
-| copilot | `copilot` | 1.0.80 | 2026-08-24T05:26:59Z | `7f6fe7d34f52` |
-| gemini | `gemini` | 0.56.0 | 2026-08-24T05:26:59Z | `ab89cab289ec` |
-| kimi | `kimi` | 1.49.0 | 2026-08-24T05:26:59Z | `62d980416d74` |
-| opencode | `opencode` | 1.18.21 | 2026-08-24T05:26:59Z | `9ce9575ba003` |
-| pydantic_ai | `clai` | 2.33.0 | 2026-08-24T05:26:59Z | `8814865fc47b` |
-| qwen | `qwen` | 0.22.0 | 2026-08-24T05:26:59Z | `cc64a4222a1f` |
+| aider | `aider` | 0.86.2 | 2026-08-25T05:20:53Z | `af66e0e056db` |
+| claude | `claude` | 2.1.245 | 2026-08-25T05:20:53Z | `27e446086834` |
+| codex | `codex` | 0.149.1 | 2026-08-25T05:20:53Z | `e94741234504` |
+| copilot | `copilot` | 1.0.80 | 2026-08-25T05:20:53Z | `45b4347939ba` |
+| gemini | `gemini` | 0.56.0 | 2026-08-25T05:20:53Z | `e93cb1117ef4` |
+| kimi | `kimi` | 1.49.0 | 2026-08-25T05:20:53Z | `41bf236ce80f` |
+| opencode | `opencode` | 1.18.22 | 2026-08-25T05:20:53Z | `64e4ab2728f0` |
+| pydantic_ai | `clai` | 2.34.0 | 2026-08-25T05:20:53Z | `90ad7260188a` |
+| qwen | `qwen` | 0.22.0 | 2026-08-25T05:20:53Z | `659a5231a87e` |
 <!-- last-green:end -->
 
 ## Operator knobs

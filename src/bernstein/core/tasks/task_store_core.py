@@ -670,6 +670,34 @@ class TaskStore:
         """
         return len(self._by_parent.get(parent_task_id, ()))
 
+    def _planning_yield_is_zero(self, task: Task) -> bool:
+        """Return True when planning *task* produced no work of its own.
+
+        "Produced no work" (#4401) is scoped to this task's own attempt
+        (#4466), and a planning task can show its yield two ways:
+
+        * a task naming it in ``parent_task_id`` - the explicit link the
+          in-process splitter and the ``self-create`` route write; or
+        * a task that came into existence after this one was claimed - the
+          only signal the agent-driven planner path leaves, because its
+          prompt has the manager POST plain ``/tasks`` bodies carrying no
+          back-link, and tells it to drop the link outright when the parent
+          id does not resolve for its token.
+
+        Demanding the back-link alone would fail every agent-driven planner
+        that decomposed correctly, and the run then re-plans from scratch and
+        multiplies the subtasks instead of failing loudly. Asking only "does
+        the store hold any other task" (the original form) is satisfied by any
+        prior history at all, including this task's own earlier attempt, so it
+        never fires on a real run. The window from claim to completion is the
+        part of the store that belongs to this attempt: work that predates the
+        claim is somebody else's, and an empty window is a zero yield.
+        """
+        if self.count_subtasks(task.id) > 0:
+            return False
+        started_at = task.claimed_at if task.claimed_at is not None else task.created_at
+        return not any(other.id != task.id and other.created_at > started_at for other in self._tasks.values())
+
     # -- persistence --------------------------------------------------------
 
     def replay_jsonl(self) -> None:
@@ -1306,6 +1334,49 @@ class TaskStore:
         )
         self._notify_task_updated(task)
         return True
+
+    async def _revive_blocked_dependents(self, *task_ids: str) -> None:
+        """Revive tasks stranded on *task_ids* now that a retry of them succeeded.
+
+        A failed dependency that is retried and then completes does not
+        automatically clear its stranded dependents: the cascade that ran
+        when it first failed moved them to ``BLOCKED_BY_FAILED_DEP`` naming
+        the original id, and the original id is still terminal. This walks
+        the same frontier as :meth:`_cascade_unblock_dependency` but seeds it
+        from ``retry_of`` links, so a dependent whose
+        ``blocking_task_id`` matches a retried-and-succeeded task is moved
+        back to ``OPEN``.
+
+        Only the direct dependent is rewired -- a task stranded on a task
+        that was itself stranded is not reachable through this path, and the
+        retry's own completion re-runs the transitive unblock. Mirrors
+        :meth:`_cascade_failed_dependency`, which strands the same ring in
+        the failure direction (issue #4376).
+
+        Must be called with ``self._lock`` held.
+        """
+        solved_blocker_ids: set[str] = set()
+        for tid in task_ids:
+            completed_task = self._tasks.get(tid)
+            if completed_task is None or not isinstance(completed_task.metadata, dict):
+                continue
+            retry_of = completed_task.metadata.get("retry_of")
+            if isinstance(retry_of, str) and retry_of:
+                solved_blocker_ids.add(retry_of)
+
+        frontier = set(solved_blocker_ids)
+        while frontier:
+            next_frontier: set[str] = set()
+            for candidate in sorted(self._tasks.values(), key=lambda t: t.id):
+                if candidate.status is not TaskStatus.BLOCKED_BY_FAILED_DEP:
+                    continue
+                blocker_id = (
+                    candidate.metadata.get("blocking_task_id") if isinstance(candidate.metadata, dict) else None
+                )
+                if blocker_id in solved_blocker_ids and await self._unblock_task(candidate, blocker_id):
+                    solved_blocker_ids.add(candidate.id)
+                    next_frontier.add(candidate.id)
+            frontier = next_frontier
 
     async def _cascade_unblock_dependency(self, *completed_task_ids: str) -> None:
         """Unblock tasks that were stranded by failed dependencies now succeeded by *completed_task_ids*.
@@ -2263,7 +2334,9 @@ class TaskStore:
 
             # Issue #4401: A planning/manager task that created zero child tasks has not
             # accomplished any work. It must fail rather than falsely reporting success.
-            if task.role == "manager" and not any(t.id != task_id for t in self._tasks.values()):
+            # Scoped to this task's own attempt (issue #4466) - see
+            # ``_planning_yield_is_zero``.
+            if task.role == "manager" and self._planning_yield_is_zero(task):
                 snapshot = self._claim_snapshot(task)
                 self._index_remove(task)
                 transition_task(
@@ -2308,6 +2381,7 @@ class TaskStore:
             await self._append_jsonl(self._task_to_record(task))
             await self._append_archive(task, completed_at)
             await self._complete_parent_if_ready(task.parent_task_id)
+            await self._revive_blocked_dependents(task_id)
             await self._cascade_unblock_dependency(task_id)
         if completion is not None:
             self._audit_contract_outcome(task_id, outcome="valid")
