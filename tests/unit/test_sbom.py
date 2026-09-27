@@ -72,11 +72,22 @@ def test_cyclonedx_document_structure() -> None:
     doc = sbom.to_cyclonedx_dict()
 
     assert doc["bomFormat"] == "CycloneDX"
-    assert doc["specVersion"] == "1.5"
+    assert doc["specVersion"] == "1.7"
     assert doc["serialNumber"] == "urn:uuid:12345678-1234-5678-1234-567812345678"
     assert doc["version"] == 1
     assert "timestamp" in doc["metadata"]
     assert len(doc["components"]) == 1
+
+
+def test_cyclonedx_document_validates_against_vendored_schema() -> None:
+    """The emitted SBOM document is legal CycloneDX 1.7.
+
+    The dependency SBOM and the AI BOM pin the same specification line, so
+    both are checked against the same vendored official schema.
+    """
+    from tests.fixtures.cyclonedx import validate_cyclonedx
+
+    assert validate_cyclonedx(_make_sbom().to_cyclonedx_dict()) == []
 
 
 def test_cyclonedx_component_fields() -> None:
