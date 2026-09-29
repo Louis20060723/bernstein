@@ -65,9 +65,12 @@ CYCLONEDX_SCHEMA_URL = "http://cyclonedx.org/schema/bom-1.7.schema.json"
 #: ``urn:uuid:bernstein-ai-bom:<run_id>`` form did not satisfy. The run-id
 #: is hashed into the namespace instead of being pasted into the URN, so
 #: the serial stays deterministic per run and remains one-to-one with it
-#: (the readable run-id is still in ``metadata.properties``). Deriving the
-#: namespace from the document's own schema URI keeps it stable across
-#: installs: same run-id, same serial, on every machine.
+#: (the readable run-id is still in ``metadata.properties``). The namespace
+#: is a bernstein-owned URI with a version suffix, deliberately *not* the
+#: CycloneDX schema URI: it is stable across installs (same run-id, same
+#: serial, on every machine) and does not rotate every serial when the
+#: specification bumps. Distinct documents get distinct namespaces --
+#: the dependency SBOM in ``core/security/sbom.py`` owns its own.
 _SERIAL_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://bernstein.run/compliance/ai-bom/v1")
 
 

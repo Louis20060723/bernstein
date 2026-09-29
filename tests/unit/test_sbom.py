@@ -170,6 +170,42 @@ def test_sbom_generator_generate_returns_document(tmp_path: Path) -> None:
     assert sbom.serial_number.startswith("urn:uuid:")
 
 
+def test_sbom_generator_without_run_id_emits_a_schema_legal_serial(tmp_path: Path) -> None:
+    """The pre-existing path is unchanged: a random UUID URN, and legal."""
+    from tests.fixtures.cyclonedx import validate_cyclonedx
+
+    sbom = SBOMGenerator(tmp_path).generate(source="pip")
+
+    assert validate_cyclonedx(sbom.to_cyclonedx_dict()) == []
+
+
+def test_sbom_generator_run_id_makes_the_serial_deterministic(tmp_path: Path) -> None:
+    """Same run id, same serial; a different run id is a different serial."""
+    gen = SBOMGenerator(tmp_path)
+
+    first = gen.generate(source="pip", run_id="20260927-160000")
+    second = gen.generate(source="pip", run_id="20260927-160000")
+    other = gen.generate(source="pip", run_id="20260927-160001")
+
+    assert first.serial_number == second.serial_number
+    assert first.serial_number != other.serial_number
+
+
+def test_sbom_generator_run_id_is_readable_and_the_document_validates(tmp_path: Path) -> None:
+    """The run id is recoverable without parsing the serial, and both shapes validate.
+
+    Pinned against the real code path rather than a hand-built document: a
+    fixture whose serial is itself a UUID cannot fail the way a run-shaped
+    document does, which is how the serial defect survived its own test.
+    """
+    from tests.fixtures.cyclonedx import validate_cyclonedx
+
+    document = SBOMGenerator(tmp_path).generate(source="pip", run_id="20260927-160000").to_cyclonedx_dict()
+
+    assert {"name": "bernstein:run_id", "value": "20260927-160000"} in document["metadata"]["properties"]
+    assert validate_cyclonedx(document) == []
+
+
 def test_sbom_generator_save_writes_file(tmp_path: Path) -> None:
     gen = SBOMGenerator(tmp_path)
     sbom = _make_sbom()

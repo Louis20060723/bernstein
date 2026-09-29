@@ -21,6 +21,7 @@ from typing import Any
 
 from bernstein.core.compliance.ai_bom import encode_bom, generate_bom
 from bernstein.core.compliance.ai_bom_encoders.cyclonedx import (
+    _SERIAL_NAMESPACE,
     CYCLONEDX_SCHEMA_URL,
     CYCLONEDX_SPEC_VERSION,
 )
@@ -122,6 +123,29 @@ class TestSpecificationPin:
 
     def test_vendored_schema_is_the_one_the_spec_version_names(self) -> None:
         assert f"bom-{CYCLONEDX_SPEC_VERSION}.schema.json" == BOM_SCHEMA_NAME
+
+    def test_the_three_emitters_pin_the_same_version(self) -> None:
+        """One release must not ship two CycloneDX versions.
+
+        Each emitter's own test pins its own version, so a drift fails
+        *somewhere*; this asserts the three agree with each other, which is the
+        property the lockstep claim actually makes.
+        """
+        from bernstein.core.security import compliance as security_compliance
+        from bernstein.core.security import sbom as security_sbom
+
+        pins = {
+            CYCLONEDX_SPEC_VERSION,
+            security_sbom._CYCLONEDX_SPEC_VERSION,
+            security_compliance._CYCLONEDX_SPEC_VERSION,
+        }
+        assert len(pins) == 1, f"emitters disagree on the specification version: {sorted(pins)}"
+
+    def test_documents_do_not_share_a_serial_namespace(self) -> None:
+        """Distinct documents deserve distinct serial spaces."""
+        from bernstein.core.security.sbom import _SERIAL_NAMESPACE as dependency_sbom_namespace
+
+        assert dependency_sbom_namespace != _SERIAL_NAMESPACE
 
 
 class TestModelCard:

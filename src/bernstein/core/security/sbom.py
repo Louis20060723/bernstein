@@ -37,6 +37,29 @@ logger = logging.getLogger(__name__)
 _CYCLONEDX_SPEC_VERSION = "1.7"
 _BERNSTEIN_TOOL_NAME = "bernstein"
 
+#: Namespace for the serial number of a run-shaped dependency SBOM. CycloneDX
+#: constrains ``serialNumber`` to a UUID URN (``^urn:uuid:<uuid>$``), so a run
+#: id cannot be pasted into the URN; it is hashed into the namespace instead.
+#: bernstein-owned and version-suffixed, deliberately not the schema URI (that
+#: would rotate every serial on a specification bump), and distinct from the
+#: AI-BOM encoder's namespace -- distinct documents, distinct serial spaces.
+_SERIAL_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://bernstein.run/compliance/sbom-deps/v1")
+
+
+def _document_identity(run_id: str | None) -> tuple[str, dict[str, Any]]:
+    """Return the ``(serialNumber, metadata)`` pair for a dependency SBOM.
+
+    A run id makes the serial deterministic per run and keeps the readable id in
+    ``metadata.properties``; without one the serial is a random UUID URN, which
+    is equally schema-legal but carries no correlation key.
+    """
+    if run_id is None:
+        return f"urn:uuid:{uuid.uuid4()}", {}
+    return (
+        f"urn:uuid:{uuid.uuid5(_SERIAL_NAMESPACE, run_id)}",
+        {"properties": [{"name": "bernstein:run_id", "value": run_id}]},
+    )
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -333,20 +356,28 @@ class SBOMGenerator:
         self._scan_timeout_s = scan_timeout_s
         self._artifact_dir = workdir / ".sdd" / "artifacts" / "sbom"
 
-    def generate(self, *, source: str = "pip") -> SBOMDocument:
+    def generate(self, *, source: str = "pip", run_id: str | None = None) -> SBOMDocument:
         """Generate an SBOM from the project's installed Python packages.
 
         Args:
             source: Package source label (e.g., "pip", "npm", "requirements.txt").
+            run_id: Orchestration run the artifact belongs to. Given one, the
+                serial number is derived from it (same run, same serial, on every
+                machine) and the readable id is recorded in
+                ``metadata.properties[bernstein:run_id]``; without one the serial
+                is a random UUID URN, which is equally schema-legal but carries
+                no correlation key.
 
         Returns:
             SBOMDocument with all collected components.
         """
         components = _collect_python_packages()
+        serial_number, identity_metadata = _document_identity(run_id)
         return SBOMDocument(
-            serial_number=f"urn:uuid:{uuid.uuid4()}",
+            serial_number=serial_number,
             generated_at=time.time(),
             components=components,
+            metadata=identity_metadata,
             sbom_format=self._sbom_format,
             source=source,
         )
